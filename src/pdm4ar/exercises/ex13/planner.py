@@ -1,5 +1,6 @@
 import ast
 from dataclasses import dataclass, field
+from re import U
 from typing import Union
 
 import cvxpy as cvx
@@ -129,6 +130,31 @@ class SatellitePlanner:
         self.init_state = init_state
         self.goal_state = goal_state
 
+        init_vec = np.array(
+            [
+                init_state.x,
+                init_state.y,
+                init_state.psi,
+                init_state.vx,
+                init_state.vy,
+                init_state.dpsi,
+            ]
+        )
+
+        goal_vec = np.array(
+            [
+                goal_state.x,
+                goal_state.y,
+                goal_state.psi,
+                goal_state.vx,
+                goal_state.vy,
+                goal_state.dpsi,
+            ]
+        )
+
+        self.problem_parameters["init_state"].value = init_vec
+        self.problem_parameters["goal_state"].value = goal_vec
+
         #
         # TODO: Implement SCvx algorithm or comparable
         #
@@ -144,12 +170,17 @@ class SatellitePlanner:
             update trust region
             update stopping criterion
         """
-
-        self._convexification()
-        try:
-            error = self.problem.solve(verbose=self.params.verbose_solver, solver=self.params.solver)
-        except cvx.SolverError:
-            print(f"SolverError: {self.params.solver} failed to solve the problem.")
+        # X_bar, U_bar, p_bar = self.initial_guess()
+        for iteration in range(self.params.max_iterations):
+            self._convexification()  # popolando A, B, F, r e riempendo X_bar, U_bar, p_bar
+            try:
+                error = self.problem.solve(
+                    verbose=self.params.verbose_solver, solver=self.params.solver
+                )  # linearized cost (denominator of ro)
+            except cvx.SolverError:
+                print(f"SolverError: {self.params.solver} failed to solve the problem.")
+            # update trust region (compute actual cost, new x star and old x bar)
+            # if convergence break
 
         # Example data: sequence from array
         mycmds, mystates = self._extract_seq_from_array()
@@ -199,6 +230,17 @@ class SatellitePlanner:
             "init_state": cvx.Parameter(self.satellite.n_x),
             "eta": cvx.Parameter()     #trust region radius, does it need to be modified every iteration so every time it should restart from init value or keep updating?
             # when do we set its value the 1 time? for self.problem_parameters["eta"].value
+            "goal_state": cvx.Parameter(self.satellite.n_x),
+            "A_bar": cvx.Parameter((self.satellite.n_x * self.satellite.n_x, self.params.K - 1)),
+            "B_plus_bar": cvx.Parameter((self.satellite.n_x * self.satellite.n_u, self.params.K - 1)),
+            "B_minus_bar": cvx.Parameter((self.satellite.n_x * self.satellite.n_u, self.params.K - 1)),
+            "F_bar": cvx.Parameter((self.satellite.n_x * self.satellite.n_p, self.params.K - 1)),
+            "r_bar": cvx.Parameter((self.satellite.n_x, self.params.K - 1)),
+            "X_bar": cvx.Parameter((self.satellite.n_x, self.params.K)),
+            "U_bar": cvx.Parameter((self.satellite.n_u, self.params.K)),
+            "p_bar": cvx.Parameter(self.satellite.n_p),
+            "tr_radius": cvx.Parameter(),
+            # ...quello su cui non ottimizziamo, namely stato iniziale e finale, la dinamica al k step, la initial guess?
         }
 
         return problem_parameters
@@ -248,6 +290,12 @@ class SatellitePlanner:
         Perform convexification step, i.e. Linearization and Discretization
         and populate Problem Parameters.
         """
+        self.problem_parameters["X_bar"].value = (
+            self.X_bar
+        )  # bisogna fare in modo che quando è chiamta convexification i valori di X_bar ecc descrivono il path precedente
+        self.problem_parameters["U_bar"].value = self.U_bar
+        self.problem_parameters["p_bar"].value = self.p_bar
+        # ...
         # ZOH
         # A_bar, B_bar, F_bar, r_bar = self.integrator.calculate_discretization(self.X_bar, self.U_bar, self.p_bar)
         # FOH
@@ -257,8 +305,13 @@ class SatellitePlanner:
 
         # HINT: be aware that the matrices returned by calculate_discretization are flattened in F order (this way affect your code later when you use them)
 
-        self.problem_parameters["init_state"].value = self.X_bar[:, 0]
-        # ...
+        self.problem_parameters["A_bar"].value = A_bar  # aggiornati
+        self.problem_parameters["B_plus_bar"].value = B_plus_bar
+        self.problem_parameters["B_minus_bar"].value = B_minus_bar
+        self.problem_parameters["F_bar"].value = F_bar
+        self.problem_parameters["r_bar"].value = r_bar  # aggiornati
+
+        self.problem_parameters["tr_radius"].value = SolverParameters.tr_radius
 
     def _check_convergence(self) -> bool:
         """
