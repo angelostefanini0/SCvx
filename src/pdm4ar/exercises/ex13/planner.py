@@ -33,8 +33,8 @@ class SolverParameters:
     weight_p: NDArray = field(default_factory=lambda: 10 * np.array([[1.0]]).reshape((1, -1)))  # weight for final time
 
     tr_radius: float = 5  # initial trust region radius
-    min_tr_radius: float = 1e-4  # min trust region radius
-    max_tr_radius: float = 100  # max trust region radius
+    min_tr_radius: float = 1e-4  # min trust region radius      #IN THE PAPER IT IS 1E-3
+    max_tr_radius: float = 100  # max trust region radius       #IN THE PAPER IT IS 10
     rho_0: float = 0.0  # trust region 0
     rho_1: float = 0.25  # trust region 1
     rho_2: float = 0.9  # trust region 2
@@ -183,6 +183,10 @@ class SatellitePlanner:
             "X": cvx.Variable((self.satellite.n_x, self.params.K)),
             "U": cvx.Variable((self.satellite.n_u, self.params.K)),
             "p": cvx.Variable(self.satellite.n_p),
+            "nu": cvx.Variable((self.satellite.n_x, self.params.K - 1)),
+            "nu_s": cvx.Variable((self.satellite.n_x, self.params.K - 1)),    #NOT SO SURE, IT'S FOR CONTRAINTS
+            "nu_ic": cvx.Variable(self.satellite.n_x),
+            "nu_tc": cvx.Variable(self.satellite.n_x - 3),         #JUST POSITION, NOT VELOCITY
         }
 
         return variables
@@ -192,8 +196,9 @@ class SatellitePlanner:
         Define problem parameters for SCvx.
         """
         problem_parameters = {
-            "init_state": cvx.Parameter(self.satellite.n_x)
-            # ...
+            "init_state": cvx.Parameter(self.satellite.n_x),
+            "eta": cvx.Parameter()     #trust region radius, does it need to be modified every iteration so every time it should restart from init value or keep updating?
+            # when do we set its value the 1 time? for self.problem_parameters["eta"].value
         }
 
         return problem_parameters
@@ -205,6 +210,12 @@ class SatellitePlanner:
         constraints = [
             self.variables["X"][:, 0] == self.problem_parameters["init_state"],
             # ...
+            (     # TRUST REGION CONSTRAINT
+                cvx.sum_squares(self.variables["X"] - self.problem_parameters["X_bar"])
+                + cvx.sum_squares(self.variables["U"] - self.problem_parameters["U_bar"])
+                + cvx.sum_squares(self.variables["p"] - self.problem_parameters["p_bar"])
+                <= self.problem_parameters["eta"] ** 2                        #ETA WITH OR WITHOUT .VALUE?
+            )
         ]
         return constraints
 
@@ -212,9 +223,24 @@ class SatellitePlanner:
         """
         Define objective for SCvx.
         """
+        #HERE WE CAN PUT ALSO SLACK VAR, FINAL POSITION (AS OBJ, NOT RIGID CONTRAINT), TIME, TRAJECTORY LENGHT, ACTUATION FORCES
         # Example objective
-        objective = self.params.weight_p @ self.variables["p"]
+        obj_time = self.params.weight_p @ self.variables["p"]
+        obj_terminal_violations = (self.params.lambda_nu * cvx.norm(self.variables["nu_ic"][:], p=1) 
+                                 + self.params.lambda_nu * cvx.norm(self.variables["nu_tc"][:], p=1) )
+        phi = obj_time + obj_terminal_violations
 
+        running_cost = 0          #WE COULD ADD ACTUATION FORCES
+        Gamma = []    #TO WRITE
+        for k in range(self.params.K - 1):
+            P = cvx.norm1(self.variables["nu"][:, k]) + cvx.norm1(self.variables["nu_s"][:, k])
+            Gamma.append(running_cost + self.params.lambda_nu * P)
+        delta_t = 1.0 / self.params.K
+        trapz = 0
+        for i in range (self.params.K - 2):     #in paper from 1 to K-1 but here from 0 to K-2
+            trapz += Gamma[i] + Gamma[i+1]
+        trapz = (delta_t / 2) * trapz
+        objective = phi + trapz
         return cvx.Minimize(objective)
 
     def _convexification(self):
@@ -237,14 +263,43 @@ class SatellitePlanner:
     def _check_convergence(self) -> bool:
         """
         Check convergence of SCvx.
-        """
+        """                  #WE COULD INSTEAD CHECK J_lambda - L_lambda <= stop_crit
+        delta_x = np.linalg.norm(self.variables["X"].value - self.X_bar, axis=0)
+        delta_p = np.linalg.norm(self.variables["p"].value - self.p_bar)
 
+        return bool(delta_p + np.max(delta_x) <= self.params.stop_crit)
         pass
 
     def _update_trust_region(self):
         """
         Update trust region radius.
         """
+        rho = self._compute_rho()       #WE MUST PAY ATTENTION TO SELF.ETA IF NEEDS TO BE RESTART FROM INIT VALUE
+        # Update trust region considering the computed rho
+        if rho <= self.params.rho_0:
+            self.problem_parameters["eta"].value = max(self.params.min_tr_radius, self.problem_parameters["eta"].value / self.params.alpha)
+        elif self.params.rho_0 <= rho < self.params.rho_1:
+            self.problem_parameters["eta"].value = max(self.params.min_tr_radius, self.problem_parameters["eta"].value / self.params.alpha)
+            self.X_bar = self.variables["X"].value
+            self.U_bar = self.variables["U"].value
+            self.p_bar = self.variables["p"].value
+        elif self.params.rho_1 <= rho < self.params.rho_2:
+            self.X_bar = self.variables["X"].value
+            self.U_bar = self.variables["U"].value
+            self.p_bar = self.variables["p"].value
+        else:
+            self.problem_parameters["eta"].value = min(self.params.max_tr_radius, self.params.beta * self.problem_parameters["eta"].value)
+            self.X_bar = self.variables["X"].value
+            self.U_bar = self.variables["U"].value
+            self.p_bar = self.variables["p"].value
+        pass
+
+    def _compute_rho(self) -> float:            #NEW
+        """
+        Compute rho value for trust region update.
+        rho = actual improvement / predicted improvement.
+        """
+
         pass
 
     @staticmethod
