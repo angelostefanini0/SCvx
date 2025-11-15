@@ -172,7 +172,7 @@ class SatellitePlanner:
         """
         # X_bar, U_bar, p_bar = self.initial_guess()
         for iteration in range(self.params.max_iterations):
-            self._convexification()  # popolando A, B, F, r e riempendo X_bar, U_bar, p_bar con i loro valori correnit
+            self._convexification()  # popolando A, B, F, r e riempendo X_bar, U_bar, p_bar
             try:
                 error = self.problem.solve(
                     verbose=self.params.verbose_solver, solver=self.params.solver
