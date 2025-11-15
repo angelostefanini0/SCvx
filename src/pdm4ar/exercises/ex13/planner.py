@@ -155,6 +155,8 @@ class SatellitePlanner:
         self.problem_parameters["init_state"].value = init_vec
         self.problem_parameters["goal_state"].value = goal_vec
 
+        self.problem_parameters["eta"].value = self.params.tr_radius
+
         #
         # TODO: Implement SCvx algorithm or comparable
         #
@@ -170,7 +172,8 @@ class SatellitePlanner:
             update trust region
             update stopping criterion
         """
-        # X_bar, U_bar, p_bar = self.initial_guess()
+        self.X_bar, self.U_bar, self.p_bar = self.initial_guess()
+
         for iteration in range(self.params.max_iterations):
             self._convexification()  # popolando A, B, F, r e riempendo X_bar, U_bar, p_bar
             try:
@@ -179,6 +182,12 @@ class SatellitePlanner:
                 )  # linearized cost (denominator of ro)
             except cvx.SolverError:
                 print(f"SolverError: {self.params.solver} failed to solve the problem.")
+
+            if self._check_convergence():
+                break
+
+            self._update_trust_region()  # copiando X star in self.X_bar(aggiornaimo X, U, p, radius)
+
             # update trust region (compute actual cost, new x star and old x bar)
             # if convergence break
 
@@ -214,10 +223,10 @@ class SatellitePlanner:
             "X": cvx.Variable((self.satellite.n_x, self.params.K)),
             "U": cvx.Variable((self.satellite.n_u, self.params.K)),
             "p": cvx.Variable(self.satellite.n_p),
-            "nu_k": cvx.Variable((self.satellite.n_x, self.params.K)),  # i need a nu for linearized dynamics error, 55b
-            "nu_s_k": cvx.Variable((self.satellite.n_x, self.params.K)),  # for obstacles constraints 55d
-            "nu_ic": cvx.Variable((self.satellite.n_x, self.params.K)),  # 55e
-            "nu_tc": cvx.Variable((self.satellite.n_x, self.params.K)),  # 55f
+            "nu": cvx.Variable((self.satellite.n_x, self.params.K - 1)),
+            "nu_s": cvx.Variable((self.satellite.n_x, self.params.K - 1)),  # NOT SO SURE, IT'S FOR CONTRAINTS
+            "nu_ic": cvx.Variable(self.satellite.n_x),
+            "nu_tc": cvx.Variable(self.satellite.n_x - 1),  # JUST POSITION, NOT VELOCITY
         }
 
         return variables
@@ -228,6 +237,8 @@ class SatellitePlanner:
         """
         problem_parameters = {
             "init_state": cvx.Parameter(self.satellite.n_x),
+            "eta": cvx.Parameter(),  # trust region radius, does it need to be modified every iteration so every time it should restart from init value or keep updating?
+            # when do we set its value the 1 time? for self.problem_parameters["eta"].value
             "goal_state": cvx.Parameter(self.satellite.n_x),
             "A_bar": cvx.Parameter((self.satellite.n_x * self.satellite.n_x, self.params.K - 1)),
             "B_plus_bar": cvx.Parameter((self.satellite.n_x * self.satellite.n_u, self.params.K - 1)),
@@ -237,7 +248,6 @@ class SatellitePlanner:
             "X_bar": cvx.Parameter((self.satellite.n_x, self.params.K)),
             "U_bar": cvx.Parameter((self.satellite.n_u, self.params.K)),
             "p_bar": cvx.Parameter(self.satellite.n_p),
-            "tr_radius": cvx.Parameter(),
             # ...quello su cui non ottimizziamo, namely stato iniziale e finale, la dinamica al k step, la initial guess?
         }
 
@@ -246,29 +256,92 @@ class SatellitePlanner:
     def _get_constraints(self) -> list[cvx.Constraint]:
         """
         Define constraints for SCvx.
+        Aggiungere box constraint on inputs and states, sui pianeti statici, constraint dinamica, stati iniziali e finali
         """
+
         constraints = [
             self.variables["X"][:, 0] == self.problem_parameters["init_state"],
             # ...
+            (  # TRUST REGION CONSTRAINT
+                cvx.sum_squares(self.variables["X"] - self.problem_parameters["X_bar"])
+                + cvx.sum_squares(self.variables["U"] - self.problem_parameters["U_bar"])
+                + cvx.sum_squares(self.variables["p"] - self.problem_parameters["p_bar"])
+                <= self.problem_parameters["eta"] ** 2  # ETA WITH OR WITHOUT .VALUE?
+            ),
         ]
+
+        constraints.append(self.variables["U"][:, 0] == 0.0)
+        constraints.append(self.variables["U"][:, -1] == 0.0)
+        constraints.append(
+            self.variables["X"][0:5, -1] - self.problem_parameters["goal_state"][0:5] + self.variables["nu_tc"] == 0.0
+        )
+        constraints.append(self.satellite.sp.F_limits[0] <= self.variables["U"][1, :] <= self.satellite.sp.F_limits[1])
+        constraints.append(self.satellite.sp.F_limits[0] <= self.variables["U"][0, :] <= self.satellite.sp.F_limits[1])
+        constraints.append(
+            self.variables["X"][0:6, 0] - self.problem_parameters["init_state"][0:6] + self.variables["nu_ic"] == 0.0
+        )
+        for i in self.planets:
+            planet = self.planets[i]
+            xp, yp = planet.center
+            radius = planet.radius
+            for k in range(self.params.K):
+                xk, yk = self.variables["X"][0, k], self.variables["X"][1, k]
+                rprime = (
+                    -((xk - xp) ** 2)
+                    - (yk - yp) ** 2
+                    + (radius + self.sg.w_panel + self.sg.w_half) ** 2
+                    + 2 * (xk - xp) * xk
+                    + 2 * (yk - yp) * yk
+                )
+                constraints.append(-2 * (xk - xp) * xk - 2 * (yk - yp) * yk + rprime <= 0)
+        for k in range(self.params.K - 1):
+            constraints.append(
+                self.variables["X"][:, k + 1]
+                == (
+                    self.problem_parameters["A_bar"][:, k] @ self.variables["X"][:, k]
+                    + self.problem_parameters["B_plus_bar"][:, k] @ self.variables["U"][:, k + 1]
+                    + self.problem_parameters["B_minus_bar"][:, k] @ self.variables["U"][:, k]
+                    + self.problem_parameters["F_bar"][:, k] @ self.variables["p"]
+                    + self.problem_parameters["r_bar"][:, k]
+                    + self.variables["nu"][:, k]
+                )
+            )
+
         return constraints
 
     def _get_objective(self) -> Union[cvx.Minimize, cvx.Maximize]:
         """
         Define objective for SCvx.
         """
+        # HERE WE CAN PUT ALSO SLACK VAR, FINAL POSITION (AS OBJ, NOT RIGID CONTRAINT), TIME, TRAJECTORY LENGHT, ACTUATION FORCES
         # Example objective
-        objective = self.params.weight_p @ self.variables["p"]
+        obj_time = self.params.weight_p @ self.variables["p"]
+        obj_terminal_violations = self.params.lambda_nu * cvx.norm(
+            self.variables["nu_ic"][:], p=1
+        ) + self.params.lambda_nu * cvx.norm(self.variables["nu_tc"][:], p=1)
+        phi = obj_time + obj_terminal_violations  # 50, terminal cost
 
+        running_cost = 0  # WE COULD ADD ACTUATION FORCES
+        Gamma = []  # TO WRITE
+        for k in range(self.params.K - 1):
+            P = cvx.norm1(self.variables["nu"][:, k]) + cvx.norm1(self.variables["nu_s"][:, k])
+            Gamma.append(running_cost + self.params.lambda_nu * P)
+        delta_t = 1.0 / self.params.K
+        trapz = 0
+        for i in range(self.params.K - 2):  # in paper from 1 to K-1 but here from 0 to K-2
+            trapz += Gamma[i] + Gamma[i + 1]
+        trapz = (delta_t / 2) * trapz
+        objective = phi + trapz
         return cvx.Minimize(objective)
 
     def _convexification(self):
         """
         Perform convexification step, i.e. Linearization and Discretization
         and populate Problem Parameters.
+        Vorremmo spostare l'assegnazione di X_bar, U_bar, p_bar come problem parameters direttamente detro update trust region, senza passare per X_bar
         """
         self.problem_parameters["X_bar"].value = (
-            self.X_bar
+            self.X_bar  # copy?
         )  # bisogna fare in modo che quando è chiamta convexification i valori di X_bar ecc descrivono il path precedente
         self.problem_parameters["U_bar"].value = self.U_bar
         self.problem_parameters["p_bar"].value = self.p_bar
@@ -288,20 +361,73 @@ class SatellitePlanner:
         self.problem_parameters["F_bar"].value = F_bar
         self.problem_parameters["r_bar"].value = r_bar  # aggiornati
 
-        self.problem_parameters["tr_radius"].value = SolverParameters.tr_radius
-
     def _check_convergence(self) -> bool:
         """
         Check convergence of SCvx.
-        """
+        """  # WE COULD INSTEAD CHECK J_lambda - L_lambda <= stop_crit
+        delta_x = np.linalg.norm(self.variables["X"].value - self.X_bar, axis=0)
+        delta_p = np.linalg.norm(self.variables["p"].value - self.p_bar)
 
-        pass
+        return bool(delta_p + np.max(delta_x) <= self.params.stop_crit)
 
     def _update_trust_region(self):
         """
         Update trust region radius.
         """
+        rho = self._compute_rho()  # WE MUST PAY ATTENTION TO SELF.ETA IF NEEDS TO BE RESTART FROM INIT VALUE
+        # Update trust region considering the computed rho
+        if rho <= self.params.rho_0:
+            self.problem_parameters["eta"].value = max(
+                self.params.min_tr_radius, self.problem_parameters["eta"].value / self.params.alpha
+            )
+        elif self.params.rho_0 <= rho < self.params.rho_1:
+            self.problem_parameters["eta"].value = max(
+                self.params.min_tr_radius, self.problem_parameters["eta"].value / self.params.alpha
+            )
+            self.X_bar = self.variables["X"].value
+            self.U_bar = self.variables["U"].value
+            self.p_bar = self.variables["p"].value
+        elif self.params.rho_1 <= rho < self.params.rho_2:
+            self.X_bar = self.variables["X"].value
+            self.U_bar = self.variables["U"].value
+            self.p_bar = self.variables["p"].value
+        else:
+            self.problem_parameters["eta"].value = min(
+                self.params.max_tr_radius, self.params.beta * self.problem_parameters["eta"].value
+            )
+            self.X_bar = self.variables["X"].value
+            self.U_bar = self.variables["U"].value
+            self.p_bar = self.variables["p"].value
         pass
+
+    def _compute_rho(self) -> float:  # NEW
+        """
+        Compute rho value for trust region update.
+        rho = actual improvement / predicted improvement.
+        """
+
+        """
+        # Define gamma lambda
+        gamma_lambda_bar = []
+        for k in range(self.params.K - 1):
+            gamma_lambda_bar.append(self.params.lambda_nu * np.linalg.norm( bhooo[k], ord=1))
+
+        gamma_lambda_opt = []
+        for k in range(self.params.K - 1):
+            gamma_lambda_opt.append(self.params.lambda_nu * np.linalg.norm(bhooo[k], ord=1))
+
+        # Compute trapezoidal integration
+        delta_t = 1.0 / self.params.K
+        gamma_bar = 0
+        for k in range(self.params.K - 2):
+            gamma_bar += delta_t / 2 * (gamma_lambda_bar[k] + gamma_lambda_bar[k + 1])
+
+        gamma_opt = 0
+        for k in range(self.params.K - 2):
+            gamma_opt += delta_t / 2 * (gamma_lambda_opt[k] + gamma_lambda_opt[k + 1])
+        """
+        rho = (cost_func_bar - cost_func_opt) / (cost_func_bar - cost_linear_opt)
+        return rho
 
     @staticmethod
     def _extract_seq_from_array() -> tuple[DgSampledSequence[SatelliteCommands], DgSampledSequence[SatelliteState]]:
