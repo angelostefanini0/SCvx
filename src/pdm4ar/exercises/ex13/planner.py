@@ -188,9 +188,6 @@ class SatellitePlanner:
 
             self._update_trust_region()  # copiando X star in self.X_bar(aggiornaimo X, U, p, radius)
 
-            # update trust region (compute actual cost, new x star and old x bar)
-            # if convergence break
-
         # Example data: sequence from array
         mycmds, mystates = self._extract_seq_from_array()
 
