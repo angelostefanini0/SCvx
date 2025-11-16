@@ -131,6 +131,33 @@ class SatellitePlanner:
         self.init_state = init_state
         self.goal_state = goal_state
 
+        init_vec = np.array(
+            [
+                init_state.x,
+                init_state.y,
+                init_state.psi,
+                init_state.vx,
+                init_state.vy,
+                init_state.dpsi,
+            ]
+        )
+
+        goal_vec = np.array(
+            [
+                goal_state.x,
+                goal_state.y,
+                goal_state.psi,
+                goal_state.vx,
+                goal_state.vy,
+                goal_state.dpsi,
+            ]
+        )
+
+        self.problem_parameters["init_state"].value = init_vec
+        self.problem_parameters["goal_state"].value = goal_vec
+
+        self.problem_parameters["eta"].value = self.params.tr_radius
+
         #
         # TODO: Implement SCvx algorithm or comparable
         #
@@ -146,6 +173,7 @@ class SatellitePlanner:
             update trust region
             update stopping criterion
         """
+        self.X_bar, self.U_bar, self.p_bar = self.initial_guess()
 
         for iteration in range(self.params.max_iterations):
             self._convexification()  # popolando A, B, F, r e riempendo X_bar, U_bar, p_bar
@@ -158,6 +186,11 @@ class SatellitePlanner:
                 print(f"SolverError: {self.params.solver} failed to solve the problem.")
             # forzo il casting a float e me lo salvo in self cosi posso riprednere il valore per computare rho
             self.error: float = cast(float, self.error)
+
+            if self._check_convergence():
+                break
+
+            self._update_trust_region()  # copiando X star in self.X_bar(aggiornaimo X, U, p in self.X_bar ecc, eta)
 
         # Example data: sequence from array
         mycmds, mystates = self._extract_seq_from_array()
@@ -192,9 +225,9 @@ class SatellitePlanner:
             "U": cvx.Variable((self.satellite.n_u, self.params.K)),
             "p": cvx.Variable(self.satellite.n_p),
             "nu": cvx.Variable((self.satellite.n_x, self.params.K - 1)),
-            "nu_s": cvx.Variable((self.satellite.n_x, self.params.K - 1)),  # NOT SO SURE, IT'S FOR CONTRAINTS
+            # "nu_s": cvx.Variable((self.satellite.n_x, self.params.K - 1)),  # NOT SO SURE, IT'S FOR CONTRAINTS
             "nu_ic": cvx.Variable(self.satellite.n_x),
-            "nu_tc": cvx.Variable(self.satellite.n_x - 3),  # JUST POSITION, NOT VELOCITY
+            "nu_tc": cvx.Variable(self.satellite.n_x - 1),  # JUST POSITION, NOT VELOCITY
         }
 
         return variables
@@ -207,6 +240,16 @@ class SatellitePlanner:
             "init_state": cvx.Parameter(self.satellite.n_x),
             "eta": cvx.Parameter(),  # trust region radius, does it need to be modified every iteration so every time it should restart from init value or keep updating?
             # when do we set its value the 1 time? for self.problem_parameters["eta"].value
+            "goal_state": cvx.Parameter(self.satellite.n_x),
+            "A_bar": cvx.Parameter((self.satellite.n_x * self.satellite.n_x, self.params.K - 1)),
+            "B_plus_bar": cvx.Parameter((self.satellite.n_x * self.satellite.n_u, self.params.K - 1)),
+            "B_minus_bar": cvx.Parameter((self.satellite.n_x * self.satellite.n_u, self.params.K - 1)),
+            "F_bar": cvx.Parameter((self.satellite.n_x * self.satellite.n_p, self.params.K - 1)),
+            "r_bar": cvx.Parameter((self.satellite.n_x, self.params.K - 1)),
+            "X_bar": cvx.Parameter((self.satellite.n_x, self.params.K)),
+            "U_bar": cvx.Parameter((self.satellite.n_u, self.params.K)),
+            "p_bar": cvx.Parameter(self.satellite.n_p),
+            # ...quello su cui non ottimizziamo, namely stato iniziale e finale, la dinamica al k step, la initial guess?
         }
 
         return problem_parameters
@@ -214,7 +257,9 @@ class SatellitePlanner:
     def _get_constraints(self) -> list[cvx.Constraint]:
         """
         Define constraints for SCvx.
+        Aggiungere box constraint on inputs and states, sui pianeti statici, constraint dinamica, stati iniziali e finali
         """
+
         constraints = [
             self.variables["X"][:, 0] == self.problem_parameters["init_state"],
             # ...
@@ -222,9 +267,68 @@ class SatellitePlanner:
                 cvx.sum_squares(self.variables["X"] - self.problem_parameters["X_bar"])
                 + cvx.sum_squares(self.variables["U"] - self.problem_parameters["U_bar"])
                 + cvx.sum_squares(self.variables["p"] - self.problem_parameters["p_bar"])
-                <= self.problem_parameters["eta"] ** 2  # ETA WITH OR WITHOUT .VALUE?
+                <= cvx.square(self.problem_parameters["eta"])  # ETA WITH OR WITHOUT .VALUE?
             ),
         ]
+
+        # TIME COSTRAINTS
+        constraints.append(self.variables["p"] <= 80.0)
+        constraints.append(self.variables["p"] >= 0.0)
+
+        # PROBLEM COSTRAINS
+        constraints.append(self.variables["U"][:, 0] == 0.0)
+        constraints.append(self.variables["U"][:, -1] == 0.0)
+        constraints.append(
+            self.variables["X"][0:5, -1] - self.problem_parameters["goal_state"][0:5] + self.variables["nu_tc"] == 0.0
+        )
+        constraints += [
+            self.satellite.sp.F_limits[0] <= self.variables["U"][1, :],
+            self.variables["U"][1, :] <= self.satellite.sp.F_limits[1],
+            self.satellite.sp.F_limits[0] <= self.variables["U"][0, :],
+            self.variables["U"][0, :] <= self.satellite.sp.F_limits[1],
+        ]
+        constraints.append(
+            self.variables["X"][0:6, 0] - self.problem_parameters["init_state"][0:6] + self.variables["nu_ic"] == 0.0
+        )
+
+        # PLANET AVOIDANCE CONSTRAINTS
+        for i in self.planets:
+            planet = self.planets[i]
+            xp, yp = planet.center
+            R = planet.radius + self.sg.w_panel + self.sg.w_half
+
+            for k in range(self.params.K):
+                xk = self.variables["X"][0, k]
+                yk = self.variables["X"][1, k]
+
+                xbar = self.problem_parameters["X_bar"][0, k]
+                ybar = self.problem_parameters["X_bar"][1, k]
+
+                Cx = -2 * (xbar - xp)
+                Cy = -2 * (ybar - yp)
+
+                rprime = -((xbar - xp) ** 2) - (ybar - yp) ** 2 + R**2 + 2 * (xbar - xp) * xbar + 2 * (ybar - yp) * ybar
+
+                constraints.append(Cx * xk + Cy * yk + rprime <= 0)
+
+        # DYNAMICS CONSTRAINTS
+
+        for k in range(self.params.K - 1):
+            A = self.problem_parameters["A_bar"][:, k].reshape(self.satellite.n_x, self.satellite.n_x)
+            Bplus = self.problem_parameters["B_plus_bar"][:, k].reshape(self.satellite.n_x, self.satellite.n_u)
+            Bminus = self.problem_parameters["B_minus_bar"][:, k].reshape(self.satellite.n_x, self.satellite.n_u)
+            F = self.problem_parameters["F_bar"][:, k].reshape(self.satellite.n_x, self.satellite.n_p)
+
+            constraints.append(
+                self.variables["X"][:, k + 1]
+                == A @ self.variables["X"][:, k]
+                + Bplus @ self.variables["U"][:, k + 1]
+                + Bminus @ self.variables["U"][:, k]
+                + F @ self.variables["p"]
+                + self.problem_parameters["r_bar"][:, k]
+                + self.variables["nu"][:, k]
+            )
+
         return constraints
 
     def _get_objective(self) -> Union[cvx.Minimize, cvx.Maximize]:
@@ -237,7 +341,7 @@ class SatellitePlanner:
         obj_terminal_violations = self.params.lambda_nu * cvx.norm(
             self.variables["nu_ic"][:], p=1
         ) + self.params.lambda_nu * cvx.norm(self.variables["nu_tc"][:], p=1)
-        phi = obj_time + obj_terminal_violations
+        phi = obj_time + obj_terminal_violations  # 50, terminal cost
 
         running_cost = 0  # WE COULD ADD ACTUATION FORCES
         Gamma = []  # TO WRITE
@@ -266,7 +370,14 @@ class SatellitePlanner:
         """
         Perform convexification step, i.e. Linearization and Discretization
         and populate Problem Parameters.
+        Vorremmo spostare l'assegnazione di X_bar, U_bar, p_bar come problem parameters direttamente detro update trust region, senza passare per X_bar
         """
+        self.problem_parameters["X_bar"].value = (
+            self.X_bar  # copy?
+        )  # bisogna fare in modo che quando è chiamta convexification i valori di X_bar ecc descrivono il path precedente
+        self.problem_parameters["U_bar"].value = self.U_bar
+        self.problem_parameters["p_bar"].value = self.p_bar
+        # ...
         # ZOH
         # A_bar, B_bar, F_bar, r_bar = self.integrator.calculate_discretization(self.X_bar, self.U_bar, self.p_bar)
         # FOH
@@ -276,8 +387,11 @@ class SatellitePlanner:
 
         # HINT: be aware that the matrices returned by calculate_discretization are flattened in F order (this way affect your code later when you use them)
 
-        self.problem_parameters["init_state"].value = self.X_bar[:, 0]
-        # ...
+        self.problem_parameters["A_bar"].value = A_bar  # aggiornati
+        self.problem_parameters["B_plus_bar"].value = B_plus_bar
+        self.problem_parameters["B_minus_bar"].value = B_minus_bar
+        self.problem_parameters["F_bar"].value = F_bar
+        self.problem_parameters["r_bar"].value = r_bar  # aggiornati
 
     def _check_convergence(self) -> bool:
         """
@@ -287,7 +401,6 @@ class SatellitePlanner:
         delta_p = np.linalg.norm(self.variables["p"].value - self.p_bar)
 
         return bool(delta_p + np.max(delta_x) <= self.params.stop_crit)
-        pass
 
     def _update_trust_region(self):
         """
@@ -391,17 +504,51 @@ class SatellitePlanner:
     @staticmethod
     def _extract_seq_from_array() -> tuple[DgSampledSequence[SatelliteCommands], DgSampledSequence[SatelliteState]]:
         """
-        Example of how to create a DgSampledSequence from numpy arrays and timestamps.
-        """
-        ts = (0, 1, 2, 3, 4)
-        # in case my planner returns 3 numpy arrays
-        F = np.array([0, 1, 2, 3, 4])
-        ddelta = np.array([0, 0, 0, 0, 0])
-        cmds_list = [SatelliteCommands(f, dd) for f, dd in zip(F, ddelta)]
-        mycmds = DgSampledSequence[SatelliteCommands](timestamps=ts, values=cmds_list)
+        # Define gamma lambda
+        gamma_lambda_bar = []
+        for k in range(self.params.K - 1):
+            gamma_lambda_bar.append(self.params.lambda_nu * np.linalg.norm( bhooo[k], ord=1))
 
-        # in case my state trajectory is in a 2d array
-        npstates = np.random.rand(len(ts), 6)
-        states = [SatelliteState(*v) for v in npstates]
-        mystates = DgSampledSequence[SatelliteState](timestamps=ts, values=states)
-        return mycmds, mystates
+        gamma_lambda_opt = []
+        for k in range(self.params.K - 1):
+            gamma_lambda_opt.append(self.params.lambda_nu * np.linalg.norm(bhooo[k], ord=1))
+
+        # Compute trapezoidal integration
+        delta_t = 1.0 / self.params.K
+        gamma_bar = 0
+        for k in range(self.params.K - 2):
+            gamma_bar += delta_t / 2 * (gamma_lambda_bar[k] + gamma_lambda_bar[k + 1])
+
+        gamma_opt = 0
+        for k in range(self.params.K - 2):
+            gamma_opt += delta_t / 2 * (gamma_lambda_opt[k] + gamma_lambda_opt[k + 1])
+        """
+        rho = (cost_func_bar - cost_func_opt) / (cost_func_bar - cost_linear_opt)
+        return rho
+
+    def _extract_seq_from_array(self):
+
+        p_star = float(self.p_bar)
+        K = self.params.K
+
+        ts = tuple([i * p_star / (K - 1) for i in range(K)])
+
+        U = self.U_bar
+        cmds_list = [SatelliteCommands(F_left=float(U[0, k]), F_right=float(U[1, k])) for k in range(K)]
+        cmd_seq = DgSampledSequence[SatelliteCommands](timestamps=ts, values=cmds_list)
+
+        X = self.X_bar
+        states_list = [
+            SatelliteState(
+                x=float(X[0, k]),
+                y=float(X[1, k]),
+                psi=float(X[2, k]),
+                vx=float(X[3, k]),
+                vy=float(X[4, k]),
+                dpsi=float(X[5, k]),
+            )
+            for k in range(K)
+        ]
+        state_seq = DgSampledSequence[SatelliteState](timestamps=ts, values=states_list)
+
+        return cmd_seq, state_seq
