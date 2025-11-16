@@ -35,8 +35,8 @@ class SolverParameters:
     weight_p: NDArray = field(default_factory=lambda: 10 * np.array([[1.0]]).reshape((1, -1)))  # weight for final time
 
     tr_radius: float = 5  # initial trust region radius
-    min_tr_radius: float = 1e-4  # min trust region radius
-    max_tr_radius: float = 100  # max trust region radius
+    min_tr_radius: float = 1e-4  # min trust region radius      #IN THE PAPER IT IS 1E-3
+    max_tr_radius: float = 100  # max trust region radius       #IN THE PAPER IT IS 10
     rho_0: float = 0.0  # trust region 0
     rho_1: float = 0.25  # trust region 1
     rho_2: float = 0.9  # trust region 2
@@ -235,7 +235,7 @@ class SatellitePlanner:
         """
         problem_parameters = {
             "init_state": cvx.Parameter(self.satellite.n_x),
-            "eta": cvx.Parameter(),  # trust region radius, does it need to be modified every iteration so every time it should restart from init value or keep updating?
+            "eta": cvx.Parameter()     #trust region radius, does it need to be modified every iteration so every time it should restart from init value or keep updating?
             # when do we set its value the 1 time? for self.problem_parameters["eta"].value
             "goal_state": cvx.Parameter(self.satellite.n_x),
             "A_bar": cvx.Parameter((self.satellite.n_x * self.satellite.n_x, self.params.K - 1)),
@@ -373,7 +373,7 @@ class SatellitePlanner:
     def _check_convergence(self) -> bool:
         """
         Check convergence of SCvx.
-        """  # WE COULD INSTEAD CHECK J_lambda - L_lambda <= stop_crit
+        """                  #WE COULD INSTEAD CHECK J_lambda - L_lambda <= stop_crit
         delta_x = np.linalg.norm(self.variables["X"].value - self.X_bar, axis=0)
         delta_p = np.linalg.norm(self.variables["p"].value - self.p_bar)
 
