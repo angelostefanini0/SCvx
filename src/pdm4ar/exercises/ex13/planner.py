@@ -345,7 +345,7 @@ class SatellitePlanner:
             for k in range(self.params.K - 1):
                 P = cvx.norm1(defect[k]) + cvx.norm1(non_convex_constr[k])
                 Gamma.append(running_cost + self.params.lambda_nu * P)
-
+        # ritorna Gamma lambda
         return Gamma
 
     def defect(self, X: NDArray, U: NDArray, p: NDArray) -> list[NDArray]:  # X_bar or variables["X"].values
