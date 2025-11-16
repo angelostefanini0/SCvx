@@ -2,6 +2,7 @@ import ast
 from dataclasses import dataclass, field
 from re import U
 from typing import Union
+import numpy as np
 
 import cvxpy as cvx
 from dg_commons import PlayerName
@@ -174,8 +175,8 @@ class SatellitePlanner:
         """
         self.X_bar, self.U_bar, self.p_bar = self.initial_guess()
 
-        for iteration in range(self.params.max_iterations):
-            self._convexification()  # popolando A, B, F, r e riempendo X_bar, U_bar, p_bar
+        for i in range(self.params.max_iterations):
+            self._convexification()  # popolando A, B, F, r problem paraneters e riempendo X_bar, U_bar, p_bar
             try:
                 error = self.problem.solve(
                     verbose=self.params.verbose_solver, solver=self.params.solver
@@ -277,31 +278,42 @@ class SatellitePlanner:
         constraints.append(
             self.variables["X"][0:6, 0] - self.problem_parameters["init_state"][0:6] + self.variables["nu_ic"] == 0.0
         )
+        # constraints planet collision avoidance
         for i in self.planets:
             planet = self.planets[i]
             xp, yp = planet.center
-            radius = planet.radius
+            R = planet.radius + self.sg.w_panel + self.sg.w_half
+
             for k in range(self.params.K):
-                xk, yk = self.variables["X"][0, k], self.variables["X"][1, k]
-                rprime = (
-                    -((xk - xp) ** 2)
-                    - (yk - yp) ** 2
-                    + (radius + self.sg.w_panel + self.sg.w_half) ** 2
-                    + 2 * (xk - xp) * xk
-                    + 2 * (yk - yp) * yk
-                )
-                constraints.append(-2 * (xk - xp) * xk - 2 * (yk - yp) * yk + rprime <= 0)
+                xk = self.variables["X"][0, k]
+                yk = self.variables["X"][1, k]
+
+                xbar = self.X_bar[0, k]
+                ybar = self.X_bar[1, k]
+
+                Cx = -2 * (xbar - xp)
+                Cy = -2 * (ybar - yp)
+
+                rprime = -((xbar - xp) ** 2) - (ybar - yp) ** 2 + R**2 + 2 * (xbar - xp) * xbar + 2 * (ybar - yp) * ybar
+
+                constraints.append(Cx * xk + Cy * yk + rprime <= 0)
+
+        # constraints dynamics
+
         for k in range(self.params.K - 1):
+            A = self.problem_parameters["A_bar"][:, k].reshape(self.satellite.n_x, self.satellite.n_x)
+            Bplus = self.problem_parameters["B_plus_bar"][:, k].reshape(self.satellite.n_x, self.satellite.n_u)
+            Bminus = self.problem_parameters["B_minus_bar"][:, k].reshape(self.satellite.n_x, self.satellite.n_u)
+            F = self.problem_parameters["F_bar"][:, k].reshape(self.satellite.n_x, self.satellite.n_p)
+
             constraints.append(
                 self.variables["X"][:, k + 1]
-                == (
-                    self.problem_parameters["A_bar"][:, k] @ self.variables["X"][:, k]
-                    + self.problem_parameters["B_plus_bar"][:, k] @ self.variables["U"][:, k + 1]
-                    + self.problem_parameters["B_minus_bar"][:, k] @ self.variables["U"][:, k]
-                    + self.problem_parameters["F_bar"][:, k] @ self.variables["p"]
-                    + self.problem_parameters["r_bar"][:, k]
-                    + self.variables["nu"][:, k]
-                )
+                == A @ self.variables["X"][:, k]
+                + Bplus @ self.variables["U"][:, k + 1]
+                + Bminus @ self.variables["U"][:, k]
+                + F @ self.variables["p"]
+                + self.problem_parameters["r_bar"][:, k]
+                + self.variables["nu"][:, k]
             )
 
         return constraints
@@ -323,7 +335,7 @@ class SatellitePlanner:
         for k in range(self.params.K - 1):
             P = cvx.norm1(self.variables["nu"][:, k]) + cvx.norm1(self.variables["nu_s"][:, k])
             Gamma.append(running_cost + self.params.lambda_nu * P)
-        delta_t = 1.0 / self.params.K
+        delta_t = 1.0 / (self.params.K - 1)
         trapz = 0
         for i in range(self.params.K - 2):  # in paper from 1 to K-1 but here from 0 to K-2
             trapz += Gamma[i] + Gamma[i + 1]
@@ -426,12 +438,34 @@ class SatellitePlanner:
         rho = (cost_func_bar - cost_func_opt) / (cost_func_bar - cost_linear_opt)
         return rho
 
-    @staticmethod
-    def _extract_seq_from_array() -> tuple[DgSampledSequence[SatelliteCommands], DgSampledSequence[SatelliteState]]:
-        """
-        Example of how to create a DgSampledSequence from numpy arrays and timestamps.
-        """
-        ts = (0, 1, 2, 3, 4)
+    def _extract_seq_from_array(self):
+
+        p_star = float(self.p_bar)
+        K = self.params.K
+
+        ts = tuple([i * p_star / (K - 1) for i in range(K)])
+
+        U = self.U_bar
+        cmds_list = [SatelliteCommands(F_left=float(U[0, k]), F_right=float(U[1, k])) for k in range(K)]
+        cmd_seq = DgSampledSequence[SatelliteCommands](timestamps=ts, values=cmds_list)
+
+        X = self.X_bar
+        states_list = [
+            SatelliteState(
+                x=float(X[0, k]),
+                y=float(X[1, k]),
+                psi=float(X[2, k]),
+                vx=float(X[3, k]),
+                vy=float(X[4, k]),
+                dpsi=float(X[5, k]),
+            )
+            for k in range(K)
+        ]
+        state_seq = DgSampledSequence[SatelliteState](timestamps=ts, values=states_list)
+
+        return cmd_seq, state_seq
+
+        """ts = (0, 1, 2, 3, 4)
         # in case my planner returns 3 numpy arrays
         F = np.array([0, 1, 2, 3, 4])
         ddelta = np.array([0, 0, 0, 0, 0])
@@ -442,4 +476,4 @@ class SatellitePlanner:
         npstates = np.random.rand(len(ts), 6)
         states = [SatelliteState(*v) for v in npstates]
         mystates = DgSampledSequence[SatelliteState](timestamps=ts, values=states)
-        return mycmds, mystates
+        return mycmds, mystates"""
