@@ -1,6 +1,8 @@
 import ast
 from dataclasses import dataclass, field
-from typing import Union
+from math import cos
+from re import U
+from typing import Union, cast
 
 import cvxpy as cvx
 from dg_commons import PlayerName
@@ -145,11 +147,17 @@ class SatellitePlanner:
             update stopping criterion
         """
 
-        self._convexification()
-        try:
-            error = self.problem.solve(verbose=self.params.verbose_solver, solver=self.params.solver)
-        except cvx.SolverError:
-            print(f"SolverError: {self.params.solver} failed to solve the problem.")
+        for iteration in range(self.params.max_iterations):
+            self._convexification()  # popolando A, B, F, r e riempendo X_bar, U_bar, p_bar
+            # RICHIAMA IL COSTRUTTORE E MODIFICA I VINCOLI CON NUOVI PROBLEM PARAMETERS (BAR)
+            try:
+                error = self.problem.solve(
+                    verbose=self.params.verbose_solver, solver=self.params.solver
+                )  # linearized cost (denominator of ro)
+            except cvx.SolverError:
+                print(f"SolverError: {self.params.solver} failed to solve the problem.")
+            # forzo il casting a float e me lo salvo in self cosi posso riprednere il valore per computare rho
+            self.error: float = cast(float, self.error)
 
         # Example data: sequence from array
         mycmds, mystates = self._extract_seq_from_array()
@@ -184,9 +192,9 @@ class SatellitePlanner:
             "U": cvx.Variable((self.satellite.n_u, self.params.K)),
             "p": cvx.Variable(self.satellite.n_p),
             "nu": cvx.Variable((self.satellite.n_x, self.params.K - 1)),
-            "nu_s": cvx.Variable((self.satellite.n_x, self.params.K - 1)),    #NOT SO SURE, IT'S FOR CONTRAINTS
+            "nu_s": cvx.Variable((self.satellite.n_x, self.params.K - 1)),  # NOT SO SURE, IT'S FOR CONTRAINTS
             "nu_ic": cvx.Variable(self.satellite.n_x),
-            "nu_tc": cvx.Variable(self.satellite.n_x - 3),         #JUST POSITION, NOT VELOCITY
+            "nu_tc": cvx.Variable(self.satellite.n_x - 3),  # JUST POSITION, NOT VELOCITY
         }
 
         return variables
@@ -197,7 +205,7 @@ class SatellitePlanner:
         """
         problem_parameters = {
             "init_state": cvx.Parameter(self.satellite.n_x),
-            "eta": cvx.Parameter()     #trust region radius, does it need to be modified every iteration so every time it should restart from init value or keep updating?
+            "eta": cvx.Parameter(),  # trust region radius, does it need to be modified every iteration so every time it should restart from init value or keep updating?
             # when do we set its value the 1 time? for self.problem_parameters["eta"].value
         }
 
@@ -210,12 +218,12 @@ class SatellitePlanner:
         constraints = [
             self.variables["X"][:, 0] == self.problem_parameters["init_state"],
             # ...
-            (     # TRUST REGION CONSTRAINT
+            (  # TRUST REGION CONSTRAINT
                 cvx.sum_squares(self.variables["X"] - self.problem_parameters["X_bar"])
                 + cvx.sum_squares(self.variables["U"] - self.problem_parameters["U_bar"])
                 + cvx.sum_squares(self.variables["p"] - self.problem_parameters["p_bar"])
-                <= self.problem_parameters["eta"] ** 2                        #ETA WITH OR WITHOUT .VALUE?
-            )
+                <= self.problem_parameters["eta"] ** 2  # ETA WITH OR WITHOUT .VALUE?
+            ),
         ]
         return constraints
 
@@ -223,25 +231,36 @@ class SatellitePlanner:
         """
         Define objective for SCvx.
         """
-        #HERE WE CAN PUT ALSO SLACK VAR, FINAL POSITION (AS OBJ, NOT RIGID CONTRAINT), TIME, TRAJECTORY LENGHT, ACTUATION FORCES
+        # HERE WE CAN PUT ALSO SLACK VAR, FINAL POSITION (AS OBJ, NOT RIGID CONTRAINT), TIME, TRAJECTORY LENGHT, ACTUATION FORCES
         # Example objective
         obj_time = self.params.weight_p @ self.variables["p"]
-        obj_terminal_violations = (self.params.lambda_nu * cvx.norm(self.variables["nu_ic"][:], p=1) 
-                                 + self.params.lambda_nu * cvx.norm(self.variables["nu_tc"][:], p=1) )
+        obj_terminal_violations = self.params.lambda_nu * cvx.norm(
+            self.variables["nu_ic"][:], p=1
+        ) + self.params.lambda_nu * cvx.norm(self.variables["nu_tc"][:], p=1)
         phi = obj_time + obj_terminal_violations
 
-        running_cost = 0          #WE COULD ADD ACTUATION FORCES
-        Gamma = []    #TO WRITE
+        running_cost = 0  # WE COULD ADD ACTUATION FORCES
+        Gamma = []  # TO WRITE
         for k in range(self.params.K - 1):
-            P = cvx.norm1(self.variables["nu"][:, k]) + cvx.norm1(self.variables["nu_s"][:, k])
-            Gamma.append(running_cost + self.params.lambda_nu * P)
-        delta_t = 1.0 / self.params.K
-        trapz = 0
-        for i in range (self.params.K - 2):     #in paper from 1 to K-1 but here from 0 to K-2
-            trapz += Gamma[i] + Gamma[i+1]
-        trapz = (delta_t / 2) * trapz
-        objective = phi + trapz
+            P = cvx.norm1(self.variables["nu"][:, k]) + cvx.norm1(
+                self.variables["nu_s"][:, k]
+            )  # SE RIUSCIAMO AD AVERE TUTIT VINCOLI CONVESSI NU_S INUTILE
+            Gamma.append(
+                running_cost + self.params.lambda_nu * P
+            )  # CAPIAMO COME TRATTARLO NU_S SE ZERO, NONE O TOGLIERLO DEL TUTTO
+        objective = phi + self.trapz(Gamma)
         return cvx.Minimize(objective)
+
+    def trapz(self, values: list[float]) -> float:
+        """
+        Compute trapezoidal integration of a list.
+        """
+        delta_t = 1.0 / self.params.K
+        integral = 0
+        for i in range(len(values) - 1):  # in paper from 1 to K-1 but here from 0 to K-2
+            integral += values[i] + values[i + 1]
+        integral = (delta_t / 2) * integral
+        return integral
 
     def _convexification(self):
         """
@@ -263,7 +282,7 @@ class SatellitePlanner:
     def _check_convergence(self) -> bool:
         """
         Check convergence of SCvx.
-        """                  #WE COULD INSTEAD CHECK J_lambda - L_lambda <= stop_crit
+        """  # WE COULD INSTEAD CHECK J_lambda - L_lambda <= stop_crit
         delta_x = np.linalg.norm(self.variables["X"].value - self.X_bar, axis=0)
         delta_p = np.linalg.norm(self.variables["p"].value - self.p_bar)
 
@@ -274,12 +293,16 @@ class SatellitePlanner:
         """
         Update trust region radius.
         """
-        rho = self._compute_rho()       #WE MUST PAY ATTENTION TO SELF.ETA IF NEEDS TO BE RESTART FROM INIT VALUE
+        rho = self._compute_rho()  # WE MUST PAY ATTENTION TO SELF.ETA IF NEEDS TO BE RESTART FROM INIT VALUE
         # Update trust region considering the computed rho
         if rho <= self.params.rho_0:
-            self.problem_parameters["eta"].value = max(self.params.min_tr_radius, self.problem_parameters["eta"].value / self.params.alpha)
+            self.problem_parameters["eta"].value = max(
+                self.params.min_tr_radius, self.problem_parameters["eta"].value / self.params.alpha
+            )
         elif self.params.rho_0 <= rho < self.params.rho_1:
-            self.problem_parameters["eta"].value = max(self.params.min_tr_radius, self.problem_parameters["eta"].value / self.params.alpha)
+            self.problem_parameters["eta"].value = max(
+                self.params.min_tr_radius, self.problem_parameters["eta"].value / self.params.alpha
+            )
             self.X_bar = self.variables["X"].value
             self.U_bar = self.variables["U"].value
             self.p_bar = self.variables["p"].value
@@ -288,19 +311,82 @@ class SatellitePlanner:
             self.U_bar = self.variables["U"].value
             self.p_bar = self.variables["p"].value
         else:
-            self.problem_parameters["eta"].value = min(self.params.max_tr_radius, self.params.beta * self.problem_parameters["eta"].value)
+            self.problem_parameters["eta"].value = min(
+                self.params.max_tr_radius, self.params.beta * self.problem_parameters["eta"].value
+            )
             self.X_bar = self.variables["X"].value
             self.U_bar = self.variables["U"].value
             self.p_bar = self.variables["p"].value
         pass
 
-    def _compute_rho(self) -> float:            #NEW
+        # phi should return a scalar
+
+    def phi_lambda(self, p: NDArray, X: NDArray) -> float:  # X_bar or variables["X"].values
+        """
+        Compute phi_lambda for trust region update.
+        """
+        return float(
+            self.params.weight_p @ p
+            + self.params.lambda_nu * np.linalg.norm(X[:, 0] - self.problem_parameters["init_state"].value, ord=1)
+            + self.params.lambda_nu * np.linalg.norm(X[:, -1] - self.problem_parameters["goal_state"].value, ord=1)
+        )
+
+    # type of arg4 and 5 ??
+    def Gamma_lambda(self, running_cost: float, defect: list[NDArray], non_convex_constr: list[NDArray] | None) -> list:
+        """
+        Compute Gamma_lambda for trust region update.
+        """
+        Gamma = []
+        if non_convex_constr is None:  # if there are no NON CONVEX constraints
+            for k in range(self.params.K - 1):
+                P = cvx.norm1(defect[k])
+                Gamma.append(running_cost + self.params.lambda_nu * P)
+        else:
+            for k in range(self.params.K - 1):
+                P = cvx.norm1(defect[k]) + cvx.norm1(non_convex_constr[k])
+                Gamma.append(running_cost + self.params.lambda_nu * P)
+
+        return Gamma
+
+    def defect(self, X: NDArray, U: NDArray, p: NDArray) -> list[NDArray]:  # X_bar or variables["X"].values
+        """
+        Compute delta = x_k+1 - ψ(t_k, t_k+1, x, u, p).    #flow map
+        """
+        return [
+            X[:, k + 1]
+            - (
+                np.reshape(self.problem_parameters["A_bar"][:, k].value, (self.n_x, self.n_x)) @ X[:, k]
+                + np.reshape(self.problem_parameters["B_plus_bar"][:, k].value, (self.n_x, self.n_u)) @ U[:, k + 1]
+                + np.reshape(self.problem_parameters["B_minus_bar"][:, k].value, (self.n_x, self.n_u)) @ U[:, k]
+                + np.reshape(self.problem_parameters["F_bar"][:, k].value, (self.n_x, self.n_p)) @ p
+                + self.problem_parameters["r_bar"][:, k].value
+            )
+            for k in range(self.params.K - 1)
+        ]
+
+    def _compute_rho(self) -> float:  # NEW
         """
         Compute rho value for trust region update.
         rho = actual improvement / predicted improvement.
         """
-
-        pass
+        # gamma_lambda non so cosa mettere come argomenti
+        # running_cost Lamba potrebbe essere attuatori (U), arg_5 potrebbe essere vincoli non convessi [s(t,X,U,p)]^+
+        cost_func_bar = self.phi_lambda(self.p_bar, self.X_bar) + self.trapz(
+            self.Gamma_lambda(0, self.defect(self.X_bar, self.U_bar, self.p_bar), None)
+        )
+        cost_func_opt = self.phi_lambda(self.variables["p"].value, self.variables["X"].value) + self.trapz(
+            self.Gamma_lambda(
+                0,
+                self.defect(
+                    self.variables["X"].value,
+                    self.variables["U"].value,
+                    self.variables["p"].value,
+                ),
+                None,
+            )
+        )
+        rho = (cost_func_bar - cost_func_opt) / (cost_func_bar - self.error)
+        return rho
 
     @staticmethod
     def _extract_seq_from_array() -> tuple[DgSampledSequence[SatelliteCommands], DgSampledSequence[SatelliteState]]:
