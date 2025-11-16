@@ -176,7 +176,7 @@ class SatellitePlanner:
         self.X_bar, self.U_bar, self.p_bar = self.initial_guess()
 
         for i in range(self.params.max_iterations):
-            self._convexification()  # popolando A, B, F, r problem paraneters e riempendo X_bar, U_bar, p_bar
+            self._convexification()  # popolando A, B, F, r problem paraneters e riempendo X_bar, U_bar, p_bar parametri da self.X_bar ecc
             try:
                 error = self.problem.solve(
                     verbose=self.params.verbose_solver, solver=self.params.solver
@@ -187,7 +187,7 @@ class SatellitePlanner:
             if self._check_convergence():
                 break
 
-            self._update_trust_region()  # copiando X star in self.X_bar(aggiornaimo X, U, p, radius)
+            self._update_trust_region()  # copiando X star in self.X_bar(aggiornaimo X, U, p in self.X_bar ecc, eta)
 
         # Example data: sequence from array
         mycmds, mystates = self._extract_seq_from_array()
@@ -222,7 +222,7 @@ class SatellitePlanner:
             "U": cvx.Variable((self.satellite.n_u, self.params.K)),
             "p": cvx.Variable(self.satellite.n_p),
             "nu": cvx.Variable((self.satellite.n_x, self.params.K - 1)),
-            "nu_s": cvx.Variable((self.satellite.n_x, self.params.K - 1)),  # NOT SO SURE, IT'S FOR CONTRAINTS
+            # "nu_s": cvx.Variable((self.satellite.n_x, self.params.K - 1)),  # NOT SO SURE, IT'S FOR CONTRAINTS
             "nu_ic": cvx.Variable(self.satellite.n_x),
             "nu_tc": cvx.Variable(self.satellite.n_x - 1),  # JUST POSITION, NOT VELOCITY
         }
@@ -235,7 +235,7 @@ class SatellitePlanner:
         """
         problem_parameters = {
             "init_state": cvx.Parameter(self.satellite.n_x),
-            "eta": cvx.Parameter()     #trust region radius, does it need to be modified every iteration so every time it should restart from init value or keep updating?
+            "eta": cvx.Parameter(),  # trust region radius, does it need to be modified every iteration so every time it should restart from init value or keep updating?
             # when do we set its value the 1 time? for self.problem_parameters["eta"].value
             "goal_state": cvx.Parameter(self.satellite.n_x),
             "A_bar": cvx.Parameter((self.satellite.n_x * self.satellite.n_x, self.params.K - 1)),
@@ -264,21 +264,31 @@ class SatellitePlanner:
                 cvx.sum_squares(self.variables["X"] - self.problem_parameters["X_bar"])
                 + cvx.sum_squares(self.variables["U"] - self.problem_parameters["U_bar"])
                 + cvx.sum_squares(self.variables["p"] - self.problem_parameters["p_bar"])
-                <= self.problem_parameters["eta"] ** 2  # ETA WITH OR WITHOUT .VALUE?
+                <= cvx.square(self.problem_parameters["eta"])  # ETA WITH OR WITHOUT .VALUE?
             ),
         ]
 
+        # TIME COSTRAINTS
+        constraints.append(self.variables["p"] <= 80.0)
+        constraints.append(self.variables["p"] >= 0.0)
+
+        # PROBLEM COSTRAINS
         constraints.append(self.variables["U"][:, 0] == 0.0)
         constraints.append(self.variables["U"][:, -1] == 0.0)
         constraints.append(
             self.variables["X"][0:5, -1] - self.problem_parameters["goal_state"][0:5] + self.variables["nu_tc"] == 0.0
         )
-        constraints.append(self.satellite.sp.F_limits[0] <= self.variables["U"][1, :] <= self.satellite.sp.F_limits[1])
-        constraints.append(self.satellite.sp.F_limits[0] <= self.variables["U"][0, :] <= self.satellite.sp.F_limits[1])
+        constraints += [
+            self.satellite.sp.F_limits[0] <= self.variables["U"][1, :],
+            self.variables["U"][1, :] <= self.satellite.sp.F_limits[1],
+            self.satellite.sp.F_limits[0] <= self.variables["U"][0, :],
+            self.variables["U"][0, :] <= self.satellite.sp.F_limits[1],
+        ]
         constraints.append(
             self.variables["X"][0:6, 0] - self.problem_parameters["init_state"][0:6] + self.variables["nu_ic"] == 0.0
         )
-        # constraints planet collision avoidance
+
+        # PLANET AVOIDANCE CONSTRAINTS
         for i in self.planets:
             planet = self.planets[i]
             xp, yp = planet.center
@@ -288,8 +298,8 @@ class SatellitePlanner:
                 xk = self.variables["X"][0, k]
                 yk = self.variables["X"][1, k]
 
-                xbar = self.X_bar[0, k]
-                ybar = self.X_bar[1, k]
+                xbar = self.problem_parameters["X_bar"][0, k]
+                ybar = self.problem_parameters["X_bar"][1, k]
 
                 Cx = -2 * (xbar - xp)
                 Cy = -2 * (ybar - yp)
@@ -298,7 +308,7 @@ class SatellitePlanner:
 
                 constraints.append(Cx * xk + Cy * yk + rprime <= 0)
 
-        # constraints dynamics
+        # DYNAMICS CONSTRAINTS
 
         for k in range(self.params.K - 1):
             A = self.problem_parameters["A_bar"][:, k].reshape(self.satellite.n_x, self.satellite.n_x)
@@ -335,7 +345,7 @@ class SatellitePlanner:
         for k in range(self.params.K - 1):
             P = cvx.norm1(self.variables["nu"][:, k]) + cvx.norm1(self.variables["nu_s"][:, k])
             Gamma.append(running_cost + self.params.lambda_nu * P)
-        delta_t = 1.0 / (self.params.K - 1)
+        delta_t = 1.0 / (self.params.K)
         trapz = 0
         for i in range(self.params.K - 2):  # in paper from 1 to K-1 but here from 0 to K-2
             trapz += Gamma[i] + Gamma[i + 1]
@@ -373,7 +383,7 @@ class SatellitePlanner:
     def _check_convergence(self) -> bool:
         """
         Check convergence of SCvx.
-        """                  #WE COULD INSTEAD CHECK J_lambda - L_lambda <= stop_crit
+        """  # WE COULD INSTEAD CHECK J_lambda - L_lambda <= stop_crit
         delta_x = np.linalg.norm(self.variables["X"].value - self.X_bar, axis=0)
         delta_p = np.linalg.norm(self.variables["p"].value - self.p_bar)
 
@@ -464,16 +474,3 @@ class SatellitePlanner:
         state_seq = DgSampledSequence[SatelliteState](timestamps=ts, values=states_list)
 
         return cmd_seq, state_seq
-
-        """ts = (0, 1, 2, 3, 4)
-        # in case my planner returns 3 numpy arrays
-        F = np.array([0, 1, 2, 3, 4])
-        ddelta = np.array([0, 0, 0, 0, 0])
-        cmds_list = [SatelliteCommands(f, dd) for f, dd in zip(F, ddelta)]
-        mycmds = DgSampledSequence[SatelliteCommands](timestamps=ts, values=cmds_list)
-
-        # in case my state trajectory is in a 2d array
-        npstates = np.random.rand(len(ts), 6)
-        states = [SatelliteState(*v) for v in npstates]
-        mystates = DgSampledSequence[SatelliteState](timestamps=ts, values=states)
-        return mycmds, mystates"""
