@@ -1,8 +1,8 @@
 import ast
 from dataclasses import dataclass, field
+from math import cos
 from re import U
-from typing import Union
-import numpy as np
+from typing import Union, cast
 
 import cvxpy as cvx
 from dg_commons import PlayerName
@@ -175,14 +175,17 @@ class SatellitePlanner:
         """
         self.X_bar, self.U_bar, self.p_bar = self.initial_guess()
 
-        for i in range(self.params.max_iterations):
-            self._convexification()  # popolando A, B, F, r problem paraneters e riempendo X_bar, U_bar, p_bar parametri da self.X_bar ecc
+        for iteration in range(self.params.max_iterations):
+            self._convexification()  # popolando A, B, F, r e riempendo X_bar, U_bar, p_bar
+            # RICHIAMA IL COSTRUTTORE E MODIFICA I VINCOLI CON NUOVI PROBLEM PARAMETERS (BAR)
             try:
                 error = self.problem.solve(
                     verbose=self.params.verbose_solver, solver=self.params.solver
                 )  # linearized cost (denominator of ro)
             except cvx.SolverError:
                 print(f"SolverError: {self.params.solver} failed to solve the problem.")
+            # forzo il casting a float e me lo salvo in self cosi posso riprednere il valore per computare rho
+            self.error: float = cast(float, self.error)
 
             if self._check_convergence():
                 break
@@ -343,15 +346,25 @@ class SatellitePlanner:
         running_cost = 0  # WE COULD ADD ACTUATION FORCES
         Gamma = []  # TO WRITE
         for k in range(self.params.K - 1):
-            P = cvx.norm1(self.variables["nu"][:, k]) + cvx.norm1(self.variables["nu_s"][:, k])
-            Gamma.append(running_cost + self.params.lambda_nu * P)
-        delta_t = 1.0 / (self.params.K)
-        trapz = 0
-        for i in range(self.params.K - 2):  # in paper from 1 to K-1 but here from 0 to K-2
-            trapz += Gamma[i] + Gamma[i + 1]
-        trapz = (delta_t / 2) * trapz
-        objective = phi + trapz
+            P = cvx.norm1(self.variables["nu"][:, k]) + cvx.norm1(
+                self.variables["nu_s"][:, k]
+            )  # SE RIUSCIAMO AD AVERE TUTIT VINCOLI CONVESSI NU_S INUTILE
+            Gamma.append(
+                running_cost + self.params.lambda_nu * P
+            )  # CAPIAMO COME TRATTARLO NU_S SE ZERO, NONE O TOGLIERLO DEL TUTTO
+        objective = phi + self.trapz(Gamma)
         return cvx.Minimize(objective)
+
+    def trapz(self, values: list[float]) -> float:
+        """
+        Compute trapezoidal integration of a list.
+        """
+        delta_t = 1.0 / self.params.K
+        integral = 0
+        for i in range(len(values) - 1):  # in paper from 1 to K-1 but here from 0 to K-2
+            integral += values[i] + values[i + 1]
+        integral = (delta_t / 2) * integral
+        return integral
 
     def _convexification(self):
         """
@@ -419,12 +432,77 @@ class SatellitePlanner:
             self.p_bar = self.variables["p"].value
         pass
 
+        # phi should return a scalar
+
+    def phi_lambda(self, p: NDArray, X: NDArray) -> float:  # X_bar or variables["X"].values
+        """
+        Compute phi_lambda for trust region update.
+        """
+        return float(
+            self.params.weight_p @ p
+            + self.params.lambda_nu * np.linalg.norm(X[:, 0] - self.problem_parameters["init_state"].value, ord=1)
+            + self.params.lambda_nu * np.linalg.norm(X[:, -1] - self.problem_parameters["goal_state"].value, ord=1)
+        )
+
+    # type of arg4 and 5 ??
+    def Gamma_lambda(self, running_cost: float, defect: list[NDArray], non_convex_constr: list[NDArray] | None) -> list:
+        """
+        Compute Gamma_lambda for trust region update.
+        """
+        Gamma = []
+        if non_convex_constr is None:  # if there are no NON CONVEX constraints
+            for k in range(self.params.K - 1):
+                P = cvx.norm1(defect[k])
+                Gamma.append(running_cost + self.params.lambda_nu * P)
+        else:
+            for k in range(self.params.K - 1):
+                P = cvx.norm1(defect[k]) + cvx.norm1(non_convex_constr[k])
+                Gamma.append(running_cost + self.params.lambda_nu * P)
+        # ritorna Gamma lambda
+        return Gamma
+
+    def defect(self, X: NDArray, U: NDArray, p: NDArray) -> list[NDArray]:  # X_bar or variables["X"].values
+        """
+        Compute delta = x_k+1 - ψ(t_k, t_k+1, x, u, p).    #flow map
+        """
+        return [
+            X[:, k + 1]
+            - (
+                np.reshape(self.problem_parameters["A_bar"][:, k].value, (self.n_x, self.n_x)) @ X[:, k]
+                + np.reshape(self.problem_parameters["B_plus_bar"][:, k].value, (self.n_x, self.n_u)) @ U[:, k + 1]
+                + np.reshape(self.problem_parameters["B_minus_bar"][:, k].value, (self.n_x, self.n_u)) @ U[:, k]
+                + np.reshape(self.problem_parameters["F_bar"][:, k].value, (self.n_x, self.n_p)) @ p
+                + self.problem_parameters["r_bar"][:, k].value
+            )
+            for k in range(self.params.K - 1)
+        ]
+
     def _compute_rho(self) -> float:  # NEW
         """
         Compute rho value for trust region update.
         rho = actual improvement / predicted improvement.
         """
+        # gamma_lambda non so cosa mettere come argomenti
+        # running_cost Lamba potrebbe essere attuatori (U), arg_5 potrebbe essere vincoli non convessi [s(t,X,U,p)]^+
+        cost_func_bar = self.phi_lambda(self.p_bar, self.X_bar) + self.trapz(
+            self.Gamma_lambda(0, self.defect(self.X_bar, self.U_bar, self.p_bar), None)
+        )
+        cost_func_opt = self.phi_lambda(self.variables["p"].value, self.variables["X"].value) + self.trapz(
+            self.Gamma_lambda(
+                0,
+                self.defect(
+                    self.variables["X"].value,
+                    self.variables["U"].value,
+                    self.variables["p"].value,
+                ),
+                None,
+            )
+        )
+        rho = (cost_func_bar - cost_func_opt) / (cost_func_bar - self.error)
+        return rho
 
+    @staticmethod
+    def _extract_seq_from_array() -> tuple[DgSampledSequence[SatelliteCommands], DgSampledSequence[SatelliteState]]:
         """
         # Define gamma lambda
         gamma_lambda_bar = []
