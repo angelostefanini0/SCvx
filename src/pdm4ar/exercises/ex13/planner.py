@@ -14,6 +14,7 @@ from dg_commons.sim.models.satellite_structures import (
     SatelliteParameters,
 )
 
+# from pdm4ar.exercises.ex13.agent import SatelliteAgent
 from pdm4ar.exercises.ex13.discretization import *
 from pdm4ar.exercises_def.ex13.utils_params import PlanetParams, AsteroidParams
 
@@ -89,6 +90,8 @@ class SatellitePlanner:
         self.sg = sg
         self.sp = sp
 
+        self.error: float = 0.0
+
         # Solver Parameters
         self.params = SolverParameters()
 
@@ -111,16 +114,17 @@ class SatellitePlanner:
         # Problem Parameters
         self.problem_parameters = self._get_problem_parameters()
 
-        self.X_bar, self.U_bar, self.p_bar = self.initial_guess()
+        # self.X_bar, self.U_bar, self.p_bar = self.initial_guess()
 
         # Constraints
-        constraints = self._get_constraints()
+        # constraints = self._get_constraints()
 
         # Objective
-        objective = self._get_objective()
+        # objective = self._get_objective()
 
         # Cvx Optimisation Problem
-        self.problem = cvx.Problem(objective, constraints)
+
+    # self.problem = cvx.Problem(objective, constraints)
 
     def compute_trajectory(
         self, init_state: SatelliteState, goal_state: DynObstacleState
@@ -160,6 +164,11 @@ class SatellitePlanner:
 
         self.X_bar, self.U_bar, self.p_bar = self.initial_guess()
 
+        constraints = self._get_constraints()
+        objective = self._get_objective()
+
+        self.problem = cvx.Problem(objective, constraints)
+
         for iteration in range(self.params.max_iterations):
             self._convexification()  # popolando A, B, F, r e riempendo X_bar, U_bar, p_bar
             # RICHIAMA IL COSTRUTTORE E MODIFICA I VINCOLI CON NUOVI PROBLEM PARAMETERS (BAR)
@@ -186,6 +195,10 @@ class SatellitePlanner:
         """
         Define initial guess for SCvx.
         """
+
+        init_state = self.init_state
+        goal_state = self.goal_state
+
         K = self.params.K
 
         X = np.zeros((self.satellite.n_x, K))
@@ -194,22 +207,22 @@ class SatellitePlanner:
 
         x0 = np.array(
             [
-                self.init_state.x,
-                self.init_state.y,
-                self.init_state.psi,
-                self.init_state.vx,
-                self.init_state.vy,
-                self.init_state.dpsi,
+                init_state.x,
+                init_state.y,
+                init_state.psi,
+                init_state.vx,
+                init_state.vy,
+                init_state.dpsi,
             ]
         )
         xt = np.array(
             [
-                self.goal_state.x,
-                self.goal_state.y,
-                self.goal_state.psi,
-                self.goal_state.vx,
-                self.goal_state.vy,
-                self.goal_state.dpsi,
+                goal_state.x,
+                goal_state.y,
+                goal_state.psi,
+                goal_state.vx,
+                goal_state.vy,
+                goal_state.dpsi,
             ]
         )
 
@@ -220,7 +233,7 @@ class SatellitePlanner:
 
         deltax = xt[0] - x0[0]
         deltay = xt[1] - x0[1]
-        p[0] = np.sqrt(deltax * 2 + deltay * 2) / self.sp.vx_limits[1] * 1.2
+        p[0] = np.sqrt(deltax**2 + deltay**2) / self.sp.vx_limits[1] * 1.2
         p = np.full(self.satellite.n_p, p)
 
         return X, U, p
@@ -313,7 +326,7 @@ class SatellitePlanner:
             xp, yp = planet.center
             R = planet.radius + self.sg.w_panel + self.sg.w_half
 
-            for k in range(self.params.K):
+            for k in range(self.params.K - 1):
                 xk = self.variables["X"][0, k]
                 yk = self.variables["X"][1, k]
 
@@ -330,10 +343,17 @@ class SatellitePlanner:
         # DYNAMICS CONSTRAINTS
 
         for k in range(self.params.K - 1):
-            A = self.problem_parameters["A_bar"][:, k].reshape(self.satellite.n_x, self.satellite.n_x)
-            Bplus = self.problem_parameters["B_plus_bar"][:, k].reshape(self.satellite.n_x, self.satellite.n_u)
-            Bminus = self.problem_parameters["B_minus_bar"][:, k].reshape(self.satellite.n_x, self.satellite.n_u)
-            F = self.problem_parameters["F_bar"][:, k].reshape(self.satellite.n_x, self.satellite.n_p)
+            A = cvx.reshape(self.problem_parameters["A_bar"][:, k], (self.satellite.n_x, self.satellite.n_x), order="F")
+
+            Bplus = cvx.reshape(
+                self.problem_parameters["B_plus_bar"][:, k], (self.satellite.n_x, self.satellite.n_u), order="F"
+            )
+
+            Bminus = cvx.reshape(
+                self.problem_parameters["B_minus_bar"][:, k], (self.satellite.n_x, self.satellite.n_u), order="F"
+            )
+
+            F = cvx.reshape(self.problem_parameters["F_bar"][:, k], (self.satellite.n_x, self.satellite.n_p), order="F")
 
             constraints.append(
                 self.variables["X"][:, k + 1]
@@ -461,37 +481,39 @@ class SatellitePlanner:
         )
 
     # type of arg4 and 5 ??
-    def Gamma_lambda(self, running_cost: float, defect: list[NDArray], non_convex_constr: list[NDArray] | None) -> list:
-        """
-        Compute Gamma_lambda for trust region update.
-        """
+    def Gamma_lambda(self, running_cost: float, defect: list[NDArray], non_convex_constr=None):
         Gamma = []
-        if non_convex_constr is None:  # if there are no NON CONVEX constraints
-            for k in range(self.params.K - 1):
-                P = cvx.norm1(defect[k])
-                Gamma.append(running_cost + self.params.lambda_nu * P)
-        else:
-            for k in range(self.params.K - 1):
-                P = cvx.norm1(defect[k]) + cvx.norm1(non_convex_constr[k])
-                Gamma.append(running_cost + self.params.lambda_nu * P)
-        # ritorna Gamma lambda
+        for k in range(self.params.K - 1):
+            if non_convex_constr is None:
+                penalty = self.params.lambda_nu * np.linalg.norm(defect[k], ord=1)
+            else:
+                penalty = self.params.lambda_nu * (
+                    np.linalg.norm(defect[k], ord=1) + np.linalg.norm(non_convex_constr[k], ord=1)
+                )
+            Gamma.append(running_cost + penalty)
+
         return Gamma
 
-    def defect(self, X: NDArray, U: NDArray, p: NDArray) -> list[NDArray]:  # X_bar or variables["X"].values
+    def defect(self, X: NDArray, U: NDArray, p: NDArray) -> list[NDArray]:
         """
-        Compute delta = x_k+1 - ψ(t_k, t_k+1, x, u, p).    #flow map
+        Compute the discretization defect numerically (NOT as CVX expressions).
         """
-        return [
-            X[:, k + 1]
-            - (
-                np.reshape(self.problem_parameters["A_bar"][:, k].value, (self.n_x, self.n_x)) @ X[:, k]
-                + np.reshape(self.problem_parameters["B_plus_bar"][:, k].value, (self.n_x, self.n_u)) @ U[:, k + 1]
-                + np.reshape(self.problem_parameters["B_minus_bar"][:, k].value, (self.n_x, self.n_u)) @ U[:, k]
-                + np.reshape(self.problem_parameters["F_bar"][:, k].value, (self.n_x, self.n_p)) @ p
-                + self.problem_parameters["r_bar"][:, k].value
+        defects = []
+        for k in range(self.params.K - 1):
+
+            A = self.problem_parameters["A_bar"][:, k].value.reshape(self.satellite.n_x, self.satellite.n_x, order="F")
+            Bp = self.problem_parameters["B_plus_bar"][:, k].value.reshape(
+                self.satellite.n_x, self.satellite.n_u, order="F"
             )
-            for k in range(self.params.K - 1)
-        ]
+            Bm = self.problem_parameters["B_minus_bar"][:, k].value.reshape(
+                self.satellite.n_x, self.satellite.n_u, order="F"
+            )
+            F = self.problem_parameters["F_bar"][:, k].value.reshape(self.satellite.n_x, self.satellite.n_p, order="F")
+            r = self.problem_parameters["r_bar"][:, k].value
+
+            defects.append(X[:, k + 1] - (A @ X[:, k] + Bp @ U[:, k + 1] + Bm @ U[:, k] + F @ p + r))
+
+        return defects
 
     def _compute_rho(self) -> float:  # NEW
         """
@@ -503,6 +525,7 @@ class SatellitePlanner:
         cost_func_bar = self.phi_lambda(self.p_bar, self.X_bar) + self.trapz(
             self.Gamma_lambda(0, self.defect(self.X_bar, self.U_bar, self.p_bar), None)
         )
+        cost_func_bar = float(cost_func_bar)
         cost_func_opt = self.phi_lambda(self.variables["p"].value, self.variables["X"].value) + self.trapz(
             self.Gamma_lambda(
                 0,
@@ -514,7 +537,8 @@ class SatellitePlanner:
                 None,
             )
         )
-        rho = (cost_func_bar - cost_func_opt) / (cost_func_bar - self.error)
+        cost_func_opt = float(cost_func_opt)
+        rho = (cost_func_bar - cost_func_opt) / (cost_func_bar - float(self.error))
         return rho
 
     def _extract_seq_from_array(self):

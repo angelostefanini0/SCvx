@@ -132,6 +132,4 @@ class SatelliteAgent(Agent):
         # FirstOrderHold
         cmds = self.cmds_plan.at_interp(sim_obs.time)
 
-        return SatelliteCommands(
-            F_left=1, F_right=1
-        )  # can be replaced by SatelliteCommands(F_left=1, F_right=1) if you want to test constant commands
+        return cmds  # can be replaced by SatelliteCommands(F_left=1, F_right=1) if you want to test constant commands
