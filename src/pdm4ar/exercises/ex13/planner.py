@@ -158,21 +158,6 @@ class SatellitePlanner:
 
         self.problem_parameters["eta"].value = self.params.tr_radius
 
-        #
-        # TODO: Implement SCvx algorithm or comparable
-        #
-
-        """
-        for SCvx it would follow a logic similar to:
-        
-        initial guess interpolation
-        while stopping criterion not satisfied
-            convexify
-            discretize
-            solve convex sub problem
-            update trust region
-            update stopping criterion
-        """
         self.X_bar, self.U_bar, self.p_bar = self.initial_guess()
 
         for iteration in range(self.params.max_iterations):
@@ -207,6 +192,37 @@ class SatellitePlanner:
         U = np.zeros((self.satellite.n_u, K))
         p = np.zeros((self.satellite.n_p))
 
+        x0 = np.array(
+            [
+                self.init_state.x,
+                self.init_state.y,
+                self.init_state.psi,
+                self.init_state.vx,
+                self.init_state.vy,
+                self.init_state.dpsi,
+            ]
+        )
+        xt = np.array(
+            [
+                self.goal_state.x,
+                self.goal_state.y,
+                self.goal_state.psi,
+                self.goal_state.vx,
+                self.goal_state.vy,
+                self.goal_state.dpsi,
+            ]
+        )
+
+        for i in range(K):
+            t = i / (K - 1)
+            X[:, i] = (1 - t) * x0 + t * xt
+            U[:, i] = np.array([0.0, 0.0])  # constraint: The initial and final inputs needs to be zero
+
+        deltax = xt[0] - x0[0]
+        deltay = xt[1] - x0[1]
+        p[0] = np.sqrt(deltax * 2 + deltay * 2) / self.sp.vx_limits[1] * 1.2
+        p = np.full(self.satellite.n_p, p)
+
         return X, U, p
 
     def _set_goal(self):
@@ -225,8 +241,8 @@ class SatellitePlanner:
             "U": cvx.Variable((self.satellite.n_u, self.params.K)),
             "p": cvx.Variable(self.satellite.n_p),
             "nu": cvx.Variable((self.satellite.n_x, self.params.K - 1)),
-            # "nu_s": cvx.Variable((self.satellite.n_x, self.params.K - 1)),  # NOT SO SURE, IT'S FOR CONTRAINTS
-            "nu_ic": cvx.Variable(self.satellite.n_x),
+            "nu_s": cvx.Variable((self.params.K - 1)),  # NOT SO SURE, IT'S FOR CONTRAINTS
+            "nu_ic": cvx.Variable(self.satellite.n_x - 1),
             "nu_tc": cvx.Variable(self.satellite.n_x - 1),  # JUST POSITION, NOT VELOCITY
         }
 
@@ -288,7 +304,7 @@ class SatellitePlanner:
             self.variables["U"][0, :] <= self.satellite.sp.F_limits[1],
         ]
         constraints.append(
-            self.variables["X"][0:6, 0] - self.problem_parameters["init_state"][0:6] + self.variables["nu_ic"] == 0.0
+            self.variables["X"][0:5, 0] - self.problem_parameters["init_state"][0:5] + self.variables["nu_ic"] == 0.0
         )
 
         # PLANET AVOIDANCE CONSTRAINTS
@@ -309,7 +325,7 @@ class SatellitePlanner:
 
                 rprime = -((xbar - xp) ** 2) - (ybar - yp) ** 2 + R**2 + 2 * (xbar - xp) * xbar + 2 * (ybar - yp) * ybar
 
-                constraints.append(Cx * xk + Cy * yk + rprime <= 0)
+                constraints.append(Cx * xk + Cy * yk + rprime <= self.variables["nu_s"][k])
 
         # DYNAMICS CONSTRAINTS
 
@@ -347,7 +363,7 @@ class SatellitePlanner:
         Gamma = []  # TO WRITE
         for k in range(self.params.K - 1):
             P = cvx.norm1(self.variables["nu"][:, k]) + cvx.norm1(
-                self.variables["nu_s"][:, k]
+                self.variables["nu_s"][k]
             )  # SE RIUSCIAMO AD AVERE TUTIT VINCOLI CONVESSI NU_S INUTILE
             Gamma.append(
                 running_cost + self.params.lambda_nu * P
@@ -499,31 +515,6 @@ class SatellitePlanner:
             )
         )
         rho = (cost_func_bar - cost_func_opt) / (cost_func_bar - self.error)
-        return rho
-
-    @staticmethod
-    def _extract_seq_from_array() -> tuple[DgSampledSequence[SatelliteCommands], DgSampledSequence[SatelliteState]]:
-        """
-        # Define gamma lambda
-        gamma_lambda_bar = []
-        for k in range(self.params.K - 1):
-            gamma_lambda_bar.append(self.params.lambda_nu * np.linalg.norm( bhooo[k], ord=1))
-
-        gamma_lambda_opt = []
-        for k in range(self.params.K - 1):
-            gamma_lambda_opt.append(self.params.lambda_nu * np.linalg.norm(bhooo[k], ord=1))
-
-        # Compute trapezoidal integration
-        delta_t = 1.0 / self.params.K
-        gamma_bar = 0
-        for k in range(self.params.K - 2):
-            gamma_bar += delta_t / 2 * (gamma_lambda_bar[k] + gamma_lambda_bar[k + 1])
-
-        gamma_opt = 0
-        for k in range(self.params.K - 2):
-            gamma_opt += delta_t / 2 * (gamma_lambda_opt[k] + gamma_lambda_opt[k + 1])
-        """
-        rho = (cost_func_bar - cost_func_opt) / (cost_func_bar - cost_linear_opt)
         return rho
 
     def _extract_seq_from_array(self):
