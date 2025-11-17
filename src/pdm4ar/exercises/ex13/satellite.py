@@ -40,12 +40,25 @@ class SatelliteDyn:
         0x 1y 2psi 3vx 4vy 5dpsi
         """
         # TODO Modify dynamics
+        x, y, psi, vx, vy, dpsi = self.x[0], self.x[1], self.x[2], self.x[3], self.x[4], self.x[5]
+        thrust_l, thrust_r = self.u[0], self.u[1]
+        t_f = self.p[0]
+
+        m = self.sp.m_v
+        l_m = self.sg.l_m
+        I = self.sg.Iz
 
         f = spy.zeros(self.n_x, 1)  # replace this line by computing the dynamics like in following example
         "f[0] = ..."
         "f[1] = ..."
         "..."
         "f[5] = ..."
+        f[0] = vx * t_f
+        f[1] = vy * t_f
+        f[2] = dpsi * t_f
+        f[3] = 1 / m * spy.cos(psi) * (thrust_r + thrust_l) * t_f
+        f[4] = 1 / m * spy.sin(psi) * (thrust_r + thrust_l) * t_f
+        f[5] = l_m / I * (thrust_r - thrust_l) * t_f
 
         # HINT for the dynamics: SymPy is a library for symbolic mathematics.
         # Here you’ll need symbolic math, not numerical math.
