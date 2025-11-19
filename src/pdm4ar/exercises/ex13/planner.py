@@ -29,7 +29,7 @@ class SolverParameters:
     # Cvxpy solver parameters
     solver: str = "ECOS"  # specify solver to use
     verbose_solver: bool = False  # if True, the optimization steps are shown
-    max_iterations: int = 100  # max algorithm iterations
+    max_iterations: int = 40  # max algorithm iterations
 
     # SCVX parameters (Add paper reference)
     lambda_nu: float = 1e5  # slack variable weight
@@ -45,7 +45,7 @@ class SolverParameters:
     beta: float = 3.2  # mult factor trust region update
 
     # Discretization constants
-    K: int = 50  # number of discretization steps
+    K: int = 60  # number of discretization steps
     N_sub: int = 5  # used inside ode solver inside discretization
     stop_crit: float = 1e-5  # Stopping criteria constant
 
@@ -103,10 +103,10 @@ class SatellitePlanner:
         self.integrator = FirstOrderHold(self.satellite, self.params.K, self.params.N_sub)
 
         # Check dynamics implementation (pass this test before going further. It is not part of the final evaluation, so you can comment it out later)
-        if not self.integrator.check_dynamics():
+        """if not self.integrator.check_dynamics():
             raise ValueError("Dynamics check failed.")
         else:
-            print("Dynamics check passed.")
+            print("Dynamics check passed.")"""
 
         # Variables
         self.variables = self._get_variables()
@@ -170,8 +170,17 @@ class SatellitePlanner:
         self.problem = cvx.Problem(objective, constraints)
 
         for iteration in range(self.params.max_iterations):
+
+            X_old = self.X_bar.copy()
+            U_old = self.U_bar.copy()
+            p_old = self.p_bar.copy()
+
             self._convexification()  # popolando A, B, F, r e riempendo X_bar, U_bar, p_bar
             # RICHIAMA IL COSTRUTTORE E MODIFICA I VINCOLI CON NUOVI PROBLEM PARAMETERS (BAR)
+            self.variables["X"].value = self.X_bar
+            self.variables["U"].value = self.U_bar
+            self.variables["p"].value = self.p_bar
+
             try:
                 error = self.problem.solve(
                     verbose=self.params.verbose_solver, solver=self.params.solver
@@ -179,15 +188,36 @@ class SatellitePlanner:
             except cvx.SolverError:
                 print(f"SolverError: {self.params.solver} failed to solve the problem.")
             # forzo il casting a float e me lo salvo in self cosi posso riprednere il valore per computare rho
-            self.error: float = cast(float, self.error)
+            self.error = float(error)
 
-            if self._check_convergence():
-                break
+            self.X_bar = np.array(self.variables["X"].value, dtype=float)
+            self.U_bar = np.array(self.variables["U"].value, dtype=float)
+            self.p_bar = np.array(self.variables["p"].value, dtype=float)
 
-            self._update_trust_region()  # copiando X star in self.X_bar(aggiornaimo X, U, p in self.X_bar ecc, eta)
+            """if self._check_convergence():
+                break"""
+
+            """print(
+                self.variables["nu"].value,
+                self.variables["nu_ic"].value,
+                self.variables["nu_tc"].value,
+                self.variables["nu_s"].value,
+            )"""
+
+            # self._update_trust_region()  # copiando X star in self.X_bar(aggiornaimo X, U, p in self.X_bar ecc, eta)
 
         # Example data: sequence from array
         mycmds, mystates = self._extract_seq_from_array()
+        """print(
+            self.problem_parameters["A_bar"][0].value,
+            self.problem_parameters["A_bar"][1].value,
+            self.problem_parameters["A_bar"][2].value,
+            self.problem_parameters["A_bar"][10].value,
+        )"""
+
+        print(self.variables["p"].value)
+        # print(self.U_bar)
+        # print(self.X_bar, self.problem_parameters["X_bar"].value, self.variables["X"].value)
 
         return mycmds, mystates
 
@@ -270,11 +300,11 @@ class SatellitePlanner:
             "eta": cvx.Parameter(),  # trust region radius, does it need to be modified every iteration so every time it should restart from init value or keep updating?
             # when do we set its value the 1 time? for self.problem_parameters["eta"].value
             "goal_state": cvx.Parameter(self.satellite.n_x),
-            "A_bar": cvx.Parameter((self.satellite.n_x * self.satellite.n_x, self.params.K - 1)),
-            "B_plus_bar": cvx.Parameter((self.satellite.n_x * self.satellite.n_u, self.params.K - 1)),
-            "B_minus_bar": cvx.Parameter((self.satellite.n_x * self.satellite.n_u, self.params.K - 1)),
-            "F_bar": cvx.Parameter((self.satellite.n_x * self.satellite.n_p, self.params.K - 1)),
-            "r_bar": cvx.Parameter((self.satellite.n_x, self.params.K - 1)),
+            "A_bar": [cvx.Parameter((self.satellite.n_x, self.satellite.n_x)) for _ in range(self.params.K - 1)],
+            "B_plus_bar": [cvx.Parameter((self.satellite.n_x, self.satellite.n_u)) for _ in range(self.params.K - 1)],
+            "B_minus_bar": [cvx.Parameter((self.satellite.n_x, self.satellite.n_u)) for _ in range(self.params.K - 1)],
+            "F_bar": [cvx.Parameter((self.satellite.n_x, self.satellite.n_p)) for _ in range(self.params.K - 1)],
+            "r_bar": [cvx.Parameter(self.satellite.n_x) for _ in range(self.params.K - 1)],
             "X_bar": cvx.Parameter((self.satellite.n_x, self.params.K)),
             "U_bar": cvx.Parameter((self.satellite.n_u, self.params.K)),
             "p_bar": cvx.Parameter(self.satellite.n_p),
@@ -307,24 +337,19 @@ class SatellitePlanner:
         # PROBLEM COSTRAINS
         constraints.append(self.variables["U"][:, 0] == 0.0)
         constraints.append(self.variables["U"][:, -1] == 0.0)
-        constraints.append(
-            self.variables["X"][0:5, -1] - self.problem_parameters["goal_state"][0:5] + self.variables["nu_tc"] == 0.0
-        )
+        constraints.append(self.variables["X"][0:6, -1] == self.problem_parameters["goal_state"][0:6])
         constraints += [
             self.satellite.sp.F_limits[0] <= self.variables["U"][1, :],
             self.variables["U"][1, :] <= self.satellite.sp.F_limits[1],
             self.satellite.sp.F_limits[0] <= self.variables["U"][0, :],
             self.variables["U"][0, :] <= self.satellite.sp.F_limits[1],
         ]
-        constraints.append(
-            self.variables["X"][0:5, 0] - self.problem_parameters["init_state"][0:5] + self.variables["nu_ic"] == 0.0
-        )
 
         # PLANET AVOIDANCE CONSTRAINTS
         for i in self.planets:
             planet = self.planets[i]
             xp, yp = planet.center
-            R = planet.radius + self.sg.w_panel + self.sg.w_half
+            R = planet.radius + np.sqrt((self.sg.w_panel + self.sg.w_half) ** 2 + self.sg.l_r**2)
 
             for k in range(self.params.K - 1):
                 xk = self.variables["X"][0, k]
@@ -343,17 +368,11 @@ class SatellitePlanner:
         # DYNAMICS CONSTRAINTS
 
         for k in range(self.params.K - 1):
-            A = cvx.reshape(self.problem_parameters["A_bar"][:, k], (self.satellite.n_x, self.satellite.n_x), order="F")
-
-            Bplus = cvx.reshape(
-                self.problem_parameters["B_plus_bar"][:, k], (self.satellite.n_x, self.satellite.n_u), order="F"
-            )
-
-            Bminus = cvx.reshape(
-                self.problem_parameters["B_minus_bar"][:, k], (self.satellite.n_x, self.satellite.n_u), order="F"
-            )
-
-            F = cvx.reshape(self.problem_parameters["F_bar"][:, k], (self.satellite.n_x, self.satellite.n_p), order="F")
+            A = self.problem_parameters["A_bar"][k]
+            Bplus = self.problem_parameters["B_plus_bar"][k]
+            Bminus = self.problem_parameters["B_minus_bar"][k]
+            F = self.problem_parameters["F_bar"][k]
+            r = self.problem_parameters["r_bar"][k]
 
             constraints.append(
                 self.variables["X"][:, k + 1]
@@ -361,7 +380,7 @@ class SatellitePlanner:
                 + Bplus @ self.variables["U"][:, k + 1]
                 + Bminus @ self.variables["U"][:, k]
                 + F @ self.variables["p"]
-                + self.problem_parameters["r_bar"][:, k]
+                + r
                 + self.variables["nu"][:, k]
             )
 
@@ -423,11 +442,24 @@ class SatellitePlanner:
 
         # HINT: be aware that the matrices returned by calculate_discretization are flattened in F order (this way affect your code later when you use them)
 
-        self.problem_parameters["A_bar"].value = A_bar  # aggiornati
-        self.problem_parameters["B_plus_bar"].value = B_plus_bar
-        self.problem_parameters["B_minus_bar"].value = B_minus_bar
-        self.problem_parameters["F_bar"].value = F_bar
-        self.problem_parameters["r_bar"].value = r_bar  # aggiornati
+        for k in range(self.params.K - 1):
+            self.problem_parameters["A_bar"][k].value = A_bar[:, k].reshape(
+                self.satellite.n_x, self.satellite.n_x, order="F"
+            )
+
+            self.problem_parameters["B_plus_bar"][k].value = B_plus_bar[:, k].reshape(
+                self.satellite.n_x, self.satellite.n_u, order="F"
+            )
+
+            self.problem_parameters["B_minus_bar"][k].value = B_minus_bar[:, k].reshape(
+                self.satellite.n_x, self.satellite.n_u, order="F"
+            )
+
+            self.problem_parameters["F_bar"][k].value = F_bar[:, k].reshape(
+                self.satellite.n_x, self.satellite.n_p, order="F"
+            )
+
+            self.problem_parameters["r_bar"][k].value = r_bar[:, k]
 
     def _check_convergence(self) -> bool:
         """
@@ -501,15 +533,11 @@ class SatellitePlanner:
         defects = []
         for k in range(self.params.K - 1):
 
-            A = self.problem_parameters["A_bar"][:, k].value.reshape(self.satellite.n_x, self.satellite.n_x, order="F")
-            Bp = self.problem_parameters["B_plus_bar"][:, k].value.reshape(
-                self.satellite.n_x, self.satellite.n_u, order="F"
-            )
-            Bm = self.problem_parameters["B_minus_bar"][:, k].value.reshape(
-                self.satellite.n_x, self.satellite.n_u, order="F"
-            )
-            F = self.problem_parameters["F_bar"][:, k].value.reshape(self.satellite.n_x, self.satellite.n_p, order="F")
-            r = self.problem_parameters["r_bar"][:, k].value
+            A = self.problem_parameters["A_bar"][k].value
+            Bp = self.problem_parameters["B_plus_bar"][k].value
+            Bm = self.problem_parameters["B_minus_bar"][k].value
+            F = self.problem_parameters["F_bar"][k].value
+            r = self.problem_parameters["r_bar"][k].value
 
             defects.append(X[:, k + 1] - (A @ X[:, k] + Bp @ U[:, k + 1] + Bm @ U[:, k] + F @ p + r))
 
@@ -547,8 +575,10 @@ class SatellitePlanner:
         K = self.params.K
 
         ts = tuple([i * p_star / (K - 1) for i in range(K)])
+        # print(ts)
 
         U = self.U_bar
+
         cmds_list = [SatelliteCommands(F_left=float(U[0, k]), F_right=float(U[1, k])) for k in range(K)]
         cmd_seq = DgSampledSequence[SatelliteCommands](timestamps=ts, values=cmds_list)
 
