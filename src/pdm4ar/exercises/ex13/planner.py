@@ -285,8 +285,8 @@ class SatellitePlanner:
             "p": cvx.Variable(self.satellite.n_p),
             "nu": cvx.Variable((self.satellite.n_x, self.params.K - 1)),
             "nu_s": cvx.Variable((self.params.K - 1)),  # NOT SO SURE, IT'S FOR CONTRAINTS
-            "nu_ic": cvx.Variable(self.satellite.n_x - 1),
-            "nu_tc": cvx.Variable(self.satellite.n_x - 1),  # JUST POSITION, NOT VELOCITY
+            "nu_ic": cvx.Variable(self.satellite.n_x),
+            "nu_tc": cvx.Variable(self.satellite.n_x),  # JUST POSITION, NOT VELOCITY
         }
 
         return variables
@@ -320,7 +320,7 @@ class SatellitePlanner:
         """
 
         constraints = [
-            self.variables["X"][:, 0] == self.problem_parameters["init_state"],
+            self.variables["X"][0:6, 0] + self.variables["nu_ic"] == self.problem_parameters["init_state"][0:6],
             # ...
             (  # TRUST REGION CONSTRAINT
                 cvx.sum_squares(self.variables["X"] - self.problem_parameters["X_bar"])
@@ -337,7 +337,9 @@ class SatellitePlanner:
         # PROBLEM COSTRAINS
         constraints.append(self.variables["U"][:, 0] == 0.0)
         constraints.append(self.variables["U"][:, -1] == 0.0)
-        constraints.append(self.variables["X"][0:5, -1] == self.problem_parameters["goal_state"][0:5])
+        constraints.append(
+            self.variables["X"][0:6, -1] + self.variables["nu_tc"] == self.problem_parameters["goal_state"][0:6]
+        )
         constraints += [
             self.satellite.sp.F_limits[0] <= self.variables["U"][1, :],
             self.variables["U"][1, :] <= self.satellite.sp.F_limits[1],
