@@ -29,7 +29,7 @@ class SolverParameters:
     # Cvxpy solver parameters
     solver: str = "ECOS"  # specify solver to use
     verbose_solver: bool = False  # if True, the optimization steps are shown
-    max_iterations: int = 40  # max algorithm iterations
+    max_iterations: int = 30  # max algorithm iterations
 
     # SCVX parameters (Add paper reference)
     lambda_nu: float = 1e5  # slack variable weight
@@ -337,7 +337,7 @@ class SatellitePlanner:
         # PROBLEM COSTRAINS
         constraints.append(self.variables["U"][:, 0] == 0.0)
         constraints.append(self.variables["U"][:, -1] == 0.0)
-        constraints.append(self.variables["X"][0:6, -1] == self.problem_parameters["goal_state"][0:6])
+        constraints.append(self.variables["X"][0:5, -1] == self.problem_parameters["goal_state"][0:5])
         constraints += [
             self.satellite.sp.F_limits[0] <= self.variables["U"][1, :],
             self.variables["U"][1, :] <= self.satellite.sp.F_limits[1],
