@@ -45,7 +45,7 @@ class SolverParameters:
     beta: float = 3.2  # mult factor trust region update
 
     # Discretization constants
-    K: int = 60  # number of discretization steps
+    K: int = 50  # number of discretization steps
     N_sub: int = 5  # used inside ode solver inside discretization
     stop_crit: float = 1e-5  # Stopping criteria constant
 
@@ -189,10 +189,12 @@ class SatellitePlanner:
                 print(f"SolverError: {self.params.solver} failed to solve the problem.")
             # forzo il casting a float e me lo salvo in self cosi posso riprednere il valore per computare rho
             self.error = float(error)
+            print(self.error)
 
             self.X_bar = np.array(self.variables["X"].value, dtype=float)
             self.U_bar = np.array(self.variables["U"].value, dtype=float)
             self.p_bar = np.array(self.variables["p"].value, dtype=float)
+            # print(self.problem_parameters["eta"].value)
 
             """if self._check_convergence():
                 break"""
@@ -216,6 +218,8 @@ class SatellitePlanner:
         )"""
 
         print(self.variables["p"].value)
+        print(self.variables["nu_ic"].value, self.variables["nu_tc"].value)
+
         # print(self.U_bar)
         # print(self.X_bar, self.problem_parameters["X_bar"].value, self.variables["X"].value)
 
