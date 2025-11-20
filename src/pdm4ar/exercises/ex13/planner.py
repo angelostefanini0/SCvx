@@ -103,10 +103,10 @@ class SatellitePlanner:
         self.integrator = FirstOrderHold(self.satellite, self.params.K, self.params.N_sub)
 
         # Check dynamics implementation (pass this test before going further. It is not part of the final evaluation, so you can comment it out later)
-        """if not self.integrator.check_dynamics():
+        if not self.integrator.check_dynamics():
             raise ValueError("Dynamics check failed.")
         else:
-            print("Dynamics check passed.")"""
+            print("Dynamics check passed.")
 
         # Variables
         self.variables = self._get_variables()
@@ -130,99 +130,55 @@ class SatellitePlanner:
         self, init_state: SatelliteState, goal_state: DynObstacleState
     ) -> tuple[DgSampledSequence[SatelliteCommands], DgSampledSequence[SatelliteState]]:
         """
-        Compute a trajectory from init_state to goal_state.
+        Compute a trajectory from init_state to goal_state using a simple SCvx loop.
         """
         self.init_state = init_state
         self.goal_state = goal_state
 
-        init_vec = np.array(
-            [
-                init_state.x,
-                init_state.y,
-                init_state.psi,
-                init_state.vx,
-                init_state.vy,
-                init_state.dpsi,
-            ]
-        )
-
-        goal_vec = np.array(
-            [
-                goal_state.x,
-                goal_state.y,
-                goal_state.psi,
-                goal_state.vx,
-                goal_state.vy,
-                goal_state.dpsi,
-            ]
-        )
+        init_vec = np.array([init_state.x, init_state.y, init_state.psi, init_state.vx, init_state.vy, init_state.dpsi])
+        goal_vec = np.array([goal_state.x, goal_state.y, goal_state.psi, goal_state.vx, goal_state.vy, goal_state.dpsi])
 
         self.problem_parameters["init_state"].value = init_vec
         self.problem_parameters["goal_state"].value = goal_vec
 
+        # trust region iniziale (per ora non usiamo rho, ma lasciamo eta)
         self.problem_parameters["eta"].value = self.params.tr_radius
 
+        # initial guess (stati, comandi, tempo finale)
         self.X_bar, self.U_bar, self.p_bar = self.initial_guess()
 
+        # costruiamo il problema una sola volta
         constraints = self._get_constraints()
         objective = self._get_objective()
-
         self.problem = cvx.Problem(objective, constraints)
 
         for iteration in range(self.params.max_iterations):
+            # ---- salva la vecchia traiettoria ----
 
-            X_old = self.X_bar.copy()
-            U_old = self.U_bar.copy()
-            p_old = self.p_bar.copy()
+            # ---- convexification: aggiorna A_bar, B_bar, ... e X_bar/U_bar/p_bar come parametri ----
+            self._convexification()
 
-            self._convexification()  # popolando A, B, F, r e riempendo X_bar, U_bar, p_bar
-            # RICHIAMA IL COSTRUTTORE E MODIFICA I VINCOLI CON NUOVI PROBLEM PARAMETERS (BAR)
-            self.variables["X"].value = self.X_bar
-            self.variables["U"].value = self.U_bar
-            self.variables["p"].value = self.p_bar
+            # ---- warm-start delle variabili CVX ----
 
+            # ---- risolvi il problema convesso ----
             try:
                 error = self.problem.solve(
-                    verbose=self.params.verbose_solver, solver=self.params.solver
-                )  # linearized cost (denominator of ro)
+                    verbose=self.params.verbose_solver,
+                    solver=self.params.solver,
+                )
+                self.error = float(error)
             except cvx.SolverError:
                 print(f"SolverError: {self.params.solver} failed to solve the problem.")
-            # forzo il casting a float e me lo salvo in self cosi posso riprednere il valore per computare rho
-            self.error = float(error)
-            print(self.error)
+                break
 
-            self.X_bar = np.array(self.variables["X"].value, dtype=float)
-            self.U_bar = np.array(self.variables["U"].value, dtype=float)
-            self.p_bar = np.array(self.variables["p"].value, dtype=float)
-            # print(self.problem_parameters["eta"].value)
+            if self._check_convergence():
+                break
+            print(self.variables["nu_ic"].value)
 
-            """if self._check_convergence():
-                break"""
+            self._update_trust_region()  # copiando X star in self.X_bar(aggiornaimo X, U, p in self.X_bar ecc, eta)
 
-            """print(
-                self.variables["nu"].value,
-                self.variables["nu_ic"].value,
-                self.variables["nu_tc"].value,
-                self.variables["nu_s"].value,
-            )"""
-
-            # self._update_trust_region()  # copiando X star in self.X_bar(aggiornaimo X, U, p in self.X_bar ecc, eta)
-
-        # Example data: sequence from array
+        # costruisci sequenze di comandi e stati dalla soluzione finale
         mycmds, mystates = self._extract_seq_from_array()
-        """print(
-            self.problem_parameters["A_bar"][0].value,
-            self.problem_parameters["A_bar"][1].value,
-            self.problem_parameters["A_bar"][2].value,
-            self.problem_parameters["A_bar"][10].value,
-        )"""
-
-        print(self.variables["p"].value)
-        print(self.variables["nu_ic"].value, self.variables["nu_tc"].value)
-
-        # print(self.U_bar)
-        # print(self.X_bar, self.problem_parameters["X_bar"].value, self.variables["X"].value)
-
         return mycmds, mystates
 
     def initial_guess(self) -> tuple[NDArray, NDArray, NDArray]:
@@ -287,10 +243,10 @@ class SatellitePlanner:
             "X": cvx.Variable((self.satellite.n_x, self.params.K)),
             "U": cvx.Variable((self.satellite.n_u, self.params.K)),
             "p": cvx.Variable(self.satellite.n_p),
-            "nu": cvx.Variable((self.satellite.n_x, self.params.K - 1)),
-            "nu_s": cvx.Variable((self.params.K - 1)),  # NOT SO SURE, IT'S FOR CONTRAINTS
+            "nu": cvx.Variable((self.satellite.n_x, self.params.K)),
+            "nu_s": cvx.Variable((self.params.K)),  # NOT SO SURE, IT'S FOR CONTRAINTS
             "nu_ic": cvx.Variable(self.satellite.n_x),
-            "nu_tc": cvx.Variable(self.satellite.n_x),  # JUST POSITION, NOT VELOCITY
+            # "nu_tc": cvx.Variable(self.satellite.n_x - 1),  # JUST POSITION, NOT VELOCITY
         }
 
         return variables
@@ -304,11 +260,11 @@ class SatellitePlanner:
             "eta": cvx.Parameter(),  # trust region radius, does it need to be modified every iteration so every time it should restart from init value or keep updating?
             # when do we set its value the 1 time? for self.problem_parameters["eta"].value
             "goal_state": cvx.Parameter(self.satellite.n_x),
-            "A_bar": [cvx.Parameter((self.satellite.n_x, self.satellite.n_x)) for _ in range(self.params.K - 1)],
-            "B_plus_bar": [cvx.Parameter((self.satellite.n_x, self.satellite.n_u)) for _ in range(self.params.K - 1)],
-            "B_minus_bar": [cvx.Parameter((self.satellite.n_x, self.satellite.n_u)) for _ in range(self.params.K - 1)],
-            "F_bar": [cvx.Parameter((self.satellite.n_x, self.satellite.n_p)) for _ in range(self.params.K - 1)],
-            "r_bar": [cvx.Parameter(self.satellite.n_x) for _ in range(self.params.K - 1)],
+            "A_bar": cvx.Parameter((self.satellite.n_x * self.satellite.n_x, self.params.K - 1)),
+            "B_plus_bar": cvx.Parameter((self.satellite.n_x * self.satellite.n_u, self.params.K - 1)),
+            "B_minus_bar": cvx.Parameter((self.satellite.n_x * self.satellite.n_u, self.params.K - 1)),
+            "F_bar": cvx.Parameter((self.satellite.n_x * self.satellite.n_p, self.params.K - 1)),
+            "r_bar": cvx.Parameter((self.satellite.n_x, self.params.K - 1)),
             "X_bar": cvx.Parameter((self.satellite.n_x, self.params.K)),
             "U_bar": cvx.Parameter((self.satellite.n_u, self.params.K)),
             "p_bar": cvx.Parameter(self.satellite.n_p),
@@ -324,13 +280,13 @@ class SatellitePlanner:
         """
 
         constraints = [
-            self.variables["X"][0:6, 0] + self.variables["nu_ic"] == self.problem_parameters["init_state"][0:6],
+            # self.variables["X"][:, 0] == self.problem_parameters["init_state"],
             # ...
             (  # TRUST REGION CONSTRAINT
                 cvx.sum_squares(self.variables["X"] - self.problem_parameters["X_bar"])
                 + cvx.sum_squares(self.variables["U"] - self.problem_parameters["U_bar"])
                 + cvx.sum_squares(self.variables["p"] - self.problem_parameters["p_bar"])
-                <= cvx.square(self.problem_parameters["eta"])  # ETA WITH OR WITHOUT .VALUE?
+                <= (self.problem_parameters["eta"]) ** 2  # ETA WITH OR WITHOUT .VALUE?
             ),
         ]
 
@@ -341,15 +297,16 @@ class SatellitePlanner:
         # PROBLEM COSTRAINS
         constraints.append(self.variables["U"][:, 0] == 0.0)
         constraints.append(self.variables["U"][:, -1] == 0.0)
-        constraints.append(
-            self.variables["X"][0:6, -1] + self.variables["nu_tc"] == self.problem_parameters["goal_state"][0:6]
-        )
+        constraints.append(self.variables["X"][0:5, -1] == self.problem_parameters["goal_state"][0:5])
         constraints += [
             self.satellite.sp.F_limits[0] <= self.variables["U"][1, :],
             self.variables["U"][1, :] <= self.satellite.sp.F_limits[1],
             self.satellite.sp.F_limits[0] <= self.variables["U"][0, :],
             self.variables["U"][0, :] <= self.satellite.sp.F_limits[1],
         ]
+        constraints.append(
+            self.variables["X"][:, 0] - self.problem_parameters["init_state"][:] == -self.variables["nu_ic"]
+        )
 
         # PLANET AVOIDANCE CONSTRAINTS
         for i in self.planets:
@@ -374,11 +331,17 @@ class SatellitePlanner:
         # DYNAMICS CONSTRAINTS
 
         for k in range(self.params.K - 1):
-            A = self.problem_parameters["A_bar"][k]
-            Bplus = self.problem_parameters["B_plus_bar"][k]
-            Bminus = self.problem_parameters["B_minus_bar"][k]
-            F = self.problem_parameters["F_bar"][k]
-            r = self.problem_parameters["r_bar"][k]
+            A = cvx.reshape(self.problem_parameters["A_bar"][:, k], (self.satellite.n_x, self.satellite.n_x), order="F")
+
+            Bplus = cvx.reshape(
+                self.problem_parameters["B_plus_bar"][:, k], (self.satellite.n_x, self.satellite.n_u), order="F"
+            )
+
+            Bminus = cvx.reshape(
+                self.problem_parameters["B_minus_bar"][:, k], (self.satellite.n_x, self.satellite.n_u), order="F"
+            )
+
+            F = cvx.reshape(self.problem_parameters["F_bar"][:, k], (self.satellite.n_x, self.satellite.n_p), order="F")
 
             constraints.append(
                 self.variables["X"][:, k + 1]
@@ -386,7 +349,7 @@ class SatellitePlanner:
                 + Bplus @ self.variables["U"][:, k + 1]
                 + Bminus @ self.variables["U"][:, k]
                 + F @ self.variables["p"]
-                + r
+                + self.problem_parameters["r_bar"][:, k]
                 + self.variables["nu"][:, k]
             )
 
@@ -399,9 +362,7 @@ class SatellitePlanner:
         # HERE WE CAN PUT ALSO SLACK VAR, FINAL POSITION (AS OBJ, NOT RIGID CONTRAINT), TIME, TRAJECTORY LENGHT, ACTUATION FORCES
         # Example objective
         obj_time = self.params.weight_p @ self.variables["p"]
-        obj_terminal_violations = self.params.lambda_nu * cvx.norm(
-            self.variables["nu_ic"][:], p=1
-        ) + self.params.lambda_nu * cvx.norm(self.variables["nu_tc"][:], p=1)
+        obj_terminal_violations = self.params.lambda_nu * cvx.norm(self.variables["nu_ic"][:], p=1)
         phi = obj_time + obj_terminal_violations  # 50, terminal cost
 
         running_cost = 0  # WE COULD ADD ACTUATION FORCES
@@ -448,24 +409,11 @@ class SatellitePlanner:
 
         # HINT: be aware that the matrices returned by calculate_discretization are flattened in F order (this way affect your code later when you use them)
 
-        for k in range(self.params.K - 1):
-            self.problem_parameters["A_bar"][k].value = A_bar[:, k].reshape(
-                self.satellite.n_x, self.satellite.n_x, order="F"
-            )
-
-            self.problem_parameters["B_plus_bar"][k].value = B_plus_bar[:, k].reshape(
-                self.satellite.n_x, self.satellite.n_u, order="F"
-            )
-
-            self.problem_parameters["B_minus_bar"][k].value = B_minus_bar[:, k].reshape(
-                self.satellite.n_x, self.satellite.n_u, order="F"
-            )
-
-            self.problem_parameters["F_bar"][k].value = F_bar[:, k].reshape(
-                self.satellite.n_x, self.satellite.n_p, order="F"
-            )
-
-            self.problem_parameters["r_bar"][k].value = r_bar[:, k]
+        self.problem_parameters["A_bar"].value = A_bar  # aggiornati
+        self.problem_parameters["B_plus_bar"].value = B_plus_bar
+        self.problem_parameters["B_minus_bar"].value = B_minus_bar
+        self.problem_parameters["F_bar"].value = F_bar
+        self.problem_parameters["r_bar"].value = r_bar  # aggiornati
 
     def _check_convergence(self) -> bool:
         """
@@ -482,10 +430,14 @@ class SatellitePlanner:
         """
         rho = self._compute_rho()  # WE MUST PAY ATTENTION TO SELF.ETA IF NEEDS TO BE RESTART FROM INIT VALUE
         # Update trust region considering the computed rho
+        print(f"Rho: {rho}")
+
+        # print(rho <= self.params.rho_0)
         if rho <= self.params.rho_0:
             self.problem_parameters["eta"].value = max(
                 self.params.min_tr_radius, self.problem_parameters["eta"].value / self.params.alpha
             )
+
         elif self.params.rho_0 <= rho < self.params.rho_1:
             self.problem_parameters["eta"].value = max(
                 self.params.min_tr_radius, self.problem_parameters["eta"].value / self.params.alpha
@@ -506,29 +458,52 @@ class SatellitePlanner:
             self.p_bar = self.variables["p"].value
         pass
 
+        print(self.problem_parameters["eta"].value)
+
         # phi should return a scalar
 
-    def phi_lambda(self, p: NDArray, X: NDArray) -> float:  # X_bar or variables["X"].values
+    def phi_lambda(
+        self, p: NDArray, X: NDArray
+    ) -> float:  # ricordati quando arriverà docking che è non convesso                 X_bar or variables["X"].values
         """
         Compute phi_lambda for trust region update.
         """
+        # p = self.params.weight_p @ p
+        # ic = self.params.lambda_nu * np.linalg.norm(X[:, 0] - self.problem_parameters["init_state"].value, ord=1)
+        tc = self.params.lambda_nu * np.linalg.norm(X[:, -1] - self.problem_parameters["goal_state"].value, ord=1)
+        print(tc)
         return float(
             self.params.weight_p @ p
             + self.params.lambda_nu * np.linalg.norm(X[:, 0] - self.problem_parameters["init_state"].value, ord=1)
-            + self.params.lambda_nu * np.linalg.norm(X[:, -1] - self.problem_parameters["goal_state"].value, ord=1)
         )
 
     # type of arg4 and 5 ??
-    def Gamma_lambda(self, running_cost: float, defect: list[NDArray], non_convex_constr=None):
+    def Gamma_lambda(self, running_cost: float, defect: list[NDArray], X: NDArray, U: NDArray, p: NDArray):
         Gamma = []
+
         for k in range(self.params.K - 1):
-            if non_convex_constr is None:
-                penalty = self.params.lambda_nu * np.linalg.norm(defect[k], ord=1)
-            else:
-                penalty = self.params.lambda_nu * (
-                    np.linalg.norm(defect[k], ord=1) + np.linalg.norm(non_convex_constr[k], ord=1)
-                )
-            Gamma.append(running_cost + penalty)
+            defect_penalty = np.linalg.norm(defect[k], ord=1)
+
+            obstacle_violation_sum = 0.0
+
+            for i in self.planets:
+                planet = self.planets[i]
+                xp, yp = planet.center
+
+                # Calcolo Raggio aumentato
+                R = planet.radius + np.sqrt((self.sg.w_panel + self.sg.w_half) ** 2 + self.sg.l_r**2)
+
+                # Calcolo valore vincolo (scalare)
+                # Positivo = Violazione (dentro l'ostacolo)
+                val = -((X[0, k] - xp) ** 2) - (X[1, k] - yp) ** 2 + R**2
+
+                if val >= 0:
+                    obstacle_violation_sum += val
+
+            # La penalità totale è lambda * (errore dinamica + errore ostacoli)
+            total_penalty = self.params.lambda_nu * (defect_penalty + obstacle_violation_sum)
+
+            Gamma.append(running_cost + total_penalty)
 
         return Gamma
 
@@ -537,15 +512,20 @@ class SatellitePlanner:
         Compute the discretization defect numerically (NOT as CVX expressions).
         """
         defects = []
+        X_ln = self.integrator.integrate_nonlinear_piecewise(X, U, p)
         for k in range(self.params.K - 1):
 
-            A = self.problem_parameters["A_bar"][k].value
-            Bp = self.problem_parameters["B_plus_bar"][k].value
-            Bm = self.problem_parameters["B_minus_bar"][k].value
-            F = self.problem_parameters["F_bar"][k].value
-            r = self.problem_parameters["r_bar"][k].value
+            A = self.problem_parameters["A_bar"][:, k].value.reshape(self.satellite.n_x, self.satellite.n_x, order="F")
+            Bp = self.problem_parameters["B_plus_bar"][:, k].value.reshape(
+                self.satellite.n_x, self.satellite.n_u, order="F"
+            )
+            Bm = self.problem_parameters["B_minus_bar"][:, k].value.reshape(
+                self.satellite.n_x, self.satellite.n_u, order="F"
+            )
+            F = self.problem_parameters["F_bar"][:, k].value.reshape(self.satellite.n_x, self.satellite.n_p, order="F")
+            r = self.problem_parameters["r_bar"][:, k].value
 
-            defects.append(X[:, k + 1] - (A @ X[:, k] + Bp @ U[:, k + 1] + Bm @ U[:, k] + F @ p + r))
+            defects.append(-X_ln[:, k + 1] + (A @ X[:, k] + Bp @ U[:, k + 1] + Bm @ U[:, k] + F @ p + r))
 
         return defects
 
@@ -557,10 +537,17 @@ class SatellitePlanner:
         # gamma_lambda non so cosa mettere come argomenti
         # running_cost Lamba potrebbe essere attuatori (U), arg_5 potrebbe essere vincoli non convessi [s(t,X,U,p)]^+
         cost_func_bar = self.phi_lambda(self.p_bar, self.X_bar) + self.trapz(
-            self.Gamma_lambda(0, self.defect(self.X_bar, self.U_bar, self.p_bar), None)
+            self.Gamma_lambda(
+                0,
+                self.defect(self.X_bar, self.U_bar, self.p_bar),
+                self.X_bar,
+                self.U_bar,
+                self.p_bar,
+            )
         )
         cost_func_bar = float(cost_func_bar)
-        cost_func_opt = self.phi_lambda(self.variables["p"].value, self.variables["X"].value) + self.trapz(
+        phi = self.phi_lambda(self.variables["p"].value, self.variables["X"].value)
+        gamma = self.trapz(
             self.Gamma_lambda(
                 0,
                 self.defect(
@@ -568,11 +555,18 @@ class SatellitePlanner:
                     self.variables["U"].value,
                     self.variables["p"].value,
                 ),
-                None,
+                self.variables["X"].value,
+                self.variables["U"].value,
+                self.variables["p"].value,
             )
         )
+        cost_func_opt = phi + gamma
+        # print(phi)
+        # print(gamma)
+
         cost_func_opt = float(cost_func_opt)
         rho = (cost_func_bar - cost_func_opt) / (cost_func_bar - float(self.error))
+        # print(cost_func_bar, cost_func_opt, float(self.error))
         return rho
 
     def _extract_seq_from_array(self):
@@ -581,10 +575,8 @@ class SatellitePlanner:
         K = self.params.K
 
         ts = tuple([i * p_star / (K - 1) for i in range(K)])
-        # print(ts)
 
         U = self.U_bar
-
         cmds_list = [SatelliteCommands(F_left=float(U[0, k]), F_right=float(U[1, k])) for k in range(K)]
         cmd_seq = DgSampledSequence[SatelliteCommands](timestamps=ts, values=cmds_list)
 
