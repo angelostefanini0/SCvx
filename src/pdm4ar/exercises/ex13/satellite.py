@@ -44,7 +44,7 @@ class SatelliteDyn:
         thrust_l, thrust_r = self.u[0], self.u[1]
         t_f = self.p[0]
 
-        m = self.sp.m_v
+        m = self.sg.m
         l_m = self.sg.l_m
         I = self.sg.Iz
 
