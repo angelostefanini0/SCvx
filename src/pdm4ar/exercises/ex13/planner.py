@@ -13,6 +13,7 @@ from dg_commons.sim.models.satellite_structures import (
     SatelliteGeometry,
     SatelliteParameters,
 )
+from matplotlib.pylab import f
 
 from pdm4ar.exercises.ex13.discretization import *
 from pdm4ar.exercises_def.ex13.utils_params import PlanetParams, AsteroidParams
@@ -28,7 +29,7 @@ class SolverParameters:
     # Cvxpy solver parameters
     solver: str = "ECOS"  # specify solver to use
     verbose_solver: bool = False  # if True, the optimization steps are shown
-    max_iterations: int = 100  # max algorithm iterations
+    max_iterations: int = 30  # max algorithm iterations
 
     # SCVX parameters (Add paper reference)
     lambda_nu: float = 1e5  # slack variable weight
@@ -191,10 +192,10 @@ class SatellitePlanner:
             "X": cvx.Variable((self.satellite.n_x, self.params.K)),
             "U": cvx.Variable((self.satellite.n_u, self.params.K)),
             "p": cvx.Variable(self.satellite.n_p),
-            "nu": cvx.Variable((self.satellite.n_x, self.params.K - 1)),
-            "nu_s": cvx.Variable((self.satellite.n_x, self.params.K - 1)),  # NOT SO SURE, IT'S FOR CONTRAINTS
+            "nu": cvx.Variable((self.satellite.n_x, self.params.K)),
+            "nu_s": cvx.Variable((self.params.K)),  # NOT SO SURE, IT'S FOR CONTRAINTS
             "nu_ic": cvx.Variable(self.satellite.n_x),
-            "nu_tc": cvx.Variable(self.satellite.n_x - 3),  # JUST POSITION, NOT VELOCITY
+            "nu_tc": cvx.Variable(self.satellite.n_x - 1),  # JUST POSITION, NOT VELOCITY
         }
 
         return variables
@@ -216,7 +217,7 @@ class SatellitePlanner:
         Define constraints for SCvx.
         """
         constraints = [
-            self.variables["X"][:, 0] == self.problem_parameters["init_state"],
+            # self.variables["X"][:, 0] == self.problem_parameters["init_state"],  # HARD CONSTRAINT
             # ...
             (  # TRUST REGION CONSTRAINT
                 cvx.sum_squares(self.variables["X"] - self.problem_parameters["X_bar"])
@@ -225,6 +226,72 @@ class SatellitePlanner:
                 <= self.problem_parameters["eta"] ** 2  # ETA WITH OR WITHOUT .VALUE?
             ),
         ]
+
+        # TIME COSTRAINTS
+        constraints.append(self.variables["p"] <= 80.0)
+        constraints.append(self.variables["p"] >= 0.0)
+
+        # PROBLEM COSTRAINS
+        constraints.append(self.variables["U"][:, 0] == 0.0)
+        constraints.append(self.variables["U"][:, -1] == 0.0)
+        constraints.append(
+            self.variables["X"][0:5, -1] - self.variables["nu_tc"] == self.problem_parameters["goal_state"][0:5]
+        )
+        constraints += [
+            self.satellite.sp.F_limits[0] <= self.variables["U"][1, :],
+            self.variables["U"][1, :] <= self.satellite.sp.F_limits[1],
+            self.satellite.sp.F_limits[0] <= self.variables["U"][0, :],
+            self.variables["U"][0, :] <= self.satellite.sp.F_limits[1],
+        ]
+        constraints.append(
+            self.variables["X"][:, 0] + self.variables["nu_ic"] == self.problem_parameters["init_state"][:]
+        )
+
+        # PLANET AVOIDANCE CONSTRAINTS
+        for i in self.planets:
+            planet = self.planets[i]
+            xp, yp = planet.center
+            R = planet.radius + np.sqrt((self.sg.w_panel + self.sg.w_half) ** 2 + self.sg.l_r**2)
+
+            for k in range(self.params.K - 1):
+                xk = self.variables["X"][0, k]
+                yk = self.variables["X"][1, k]
+
+                xbar = self.problem_parameters["X_bar"][0, k]
+                ybar = self.problem_parameters["X_bar"][1, k]
+
+                Cx = -2 * (xbar - xp)
+                Cy = -2 * (ybar - yp)
+
+                rprime = -((xbar - xp) ** 2) - (ybar - yp) ** 2 + R**2 + 2 * (xbar - xp) * xbar + 2 * (ybar - yp) * ybar
+
+                constraints.append(Cx * xk + Cy * yk + rprime <= self.variables["nu_s"][k])
+
+        # DYNAMICS CONSTRAINTS
+
+        for k in range(self.params.K - 1):
+            A = cvx.reshape(self.problem_parameters["A_bar"][:, k], (self.satellite.n_x, self.satellite.n_x), order="F")
+
+            Bplus = cvx.reshape(
+                self.problem_parameters["B_plus_bar"][:, k], (self.satellite.n_x, self.satellite.n_u), order="F"
+            )
+
+            Bminus = cvx.reshape(
+                self.problem_parameters["B_minus_bar"][:, k], (self.satellite.n_x, self.satellite.n_u), order="F"
+            )
+
+            F = cvx.reshape(self.problem_parameters["F_bar"][:, k], (self.satellite.n_x, self.satellite.n_p), order="F")
+
+            constraints.append(
+                self.variables["X"][:, k + 1]
+                == A @ self.variables["X"][:, k]
+                + Bplus @ self.variables["U"][:, k + 1]
+                + Bminus @ self.variables["U"][:, k]
+                + F @ self.variables["p"]
+                + self.problem_parameters["r_bar"][:, k]
+                + self.variables["nu"][:, k]
+            )
+
         return constraints
 
     def _get_objective(self) -> Union[cvx.Minimize, cvx.Maximize]:
@@ -239,9 +306,9 @@ class SatellitePlanner:
         ) + self.params.lambda_nu * cvx.norm(self.variables["nu_tc"][:], p=1)
         phi = obj_time + obj_terminal_violations
 
-        running_cost = 0  # WE COULD ADD ACTUATION FORCES
+        running_cost = 0.0  # WE COULD ADD ACTUATION FORCES
         Gamma = []  # TO WRITE
-        for k in range(self.params.K - 1):
+        for k in range(self.params.K):
             P = cvx.norm1(self.variables["nu"][:, k]) + cvx.norm1(
                 self.variables["nu_s"][:, k]
             )  # SE RIUSCIAMO AD AVERE TUTIT VINCOLI CONVESSI NU_S INUTILE
@@ -255,7 +322,7 @@ class SatellitePlanner:
         """
         Compute trapezoidal integration of a list.
         """
-        delta_t = 1.0 / self.params.K
+        delta_t = 1.0 / (self.params.K - 1)  # self.p_bar[0] ? forse K ?
         integral = 0
         for i in range(len(values) - 1):  # in paper from 1 to K-1 but here from 0 to K-2
             integral += values[i] + values[i + 1]
@@ -295,10 +362,17 @@ class SatellitePlanner:
         """
         rho = self._compute_rho()  # WE MUST PAY ATTENTION TO SELF.ETA IF NEEDS TO BE RESTART FROM INIT VALUE
         # Update trust region considering the computed rho
-        if rho <= self.params.rho_0:
+        print("rho ", rho)
+        print("eta ", self.problem_parameters["eta"].value)
+        print()
+        if rho < self.params.rho_0:
             self.problem_parameters["eta"].value = max(
                 self.params.min_tr_radius, self.problem_parameters["eta"].value / self.params.alpha
             )
+            # self.variables["X"].value = self.X_old
+            # self.variables["U"].value = self.U_old
+            # self.variables["p"].value = self.p_old
+
         elif self.params.rho_0 <= rho < self.params.rho_1:
             self.problem_parameters["eta"].value = max(
                 self.params.min_tr_radius, self.problem_parameters["eta"].value / self.params.alpha
@@ -337,14 +411,30 @@ class SatellitePlanner:
         Compute Gamma_lambda for trust region update.
         """
         Gamma = []
-        if non_convex_constr is None:  # if there are no NON CONVEX constraints
-            for k in range(self.params.K - 1):
-                P = cvx.norm1(defect[k])
-                Gamma.append(running_cost + self.params.lambda_nu * P)
-        else:
-            for k in range(self.params.K - 1):
-                P = cvx.norm1(defect[k]) + cvx.norm1(non_convex_constr[k])
-                Gamma.append(running_cost + self.params.lambda_nu * P)
+
+        for k in range(self.params.K - 1):
+            defect_penalty = np.linalg.norm(defect[k], ord=1)
+
+            obstacle_violation_sum = 0.0
+
+            for i in self.planets:
+                planet = self.planets[i]
+                xp, yp = planet.center
+
+                # Calcolo Raggio aumentato
+                R = planet.radius + np.sqrt((self.sg.w_panel + self.sg.w_half) ** 2 + self.sg.l_r**2)
+
+                # Calcolo valore vincolo (scalare)
+                # Positivo = Violazione (dentro l'ostacolo)
+                val = -((X[0, k] - xp) ** 2) - (X[1, k] - yp) ** 2 + R**2
+
+                if val > 0:
+                    obstacle_violation_sum += val
+
+            # La penalità totale è lambda * (errore dinamica + errore ostacoli)
+            total_penalty = self.params.lambda_nu * (defect_penalty + np.abs(obstacle_violation_sum))
+
+            Gamma.append(running_cost + total_penalty)
 
         return Gamma
 
@@ -352,22 +442,18 @@ class SatellitePlanner:
         """
         Compute delta = x_k+1 - ψ(t_k, t_k+1, x, u, p).    #flow map
         """
-        return [
-            X[:, k + 1]
-            - (
-                np.reshape(self.problem_parameters["A_bar"][:, k].value, (self.n_x, self.n_x)) @ X[:, k]
-                + np.reshape(self.problem_parameters["B_plus_bar"][:, k].value, (self.n_x, self.n_u)) @ U[:, k + 1]
-                + np.reshape(self.problem_parameters["B_minus_bar"][:, k].value, (self.n_x, self.n_u)) @ U[:, k]
-                + np.reshape(self.problem_parameters["F_bar"][:, k].value, (self.n_x, self.n_p)) @ p
-                + self.problem_parameters["r_bar"][:, k].value
-            )
-            for k in range(self.params.K - 1)
-        ]
+        X_nl = self.integrator.integrate_nonlinear_piecewise(X, U, p)  # shape (n_x, K)
+        # defect matrix for transitions k=0..K-2 -> columns correspond to k -> k+1
+        defects_mat = X[:, 1:] - X_nl[:, 1:]  # shape (n_x, K-1)
+        defects_list = [defects_mat[:, k] for k in range(self.params.K - 1)]
+        print("Defects norm: ", defects_list[0:5])
+        return defects_list
 
-    def _compute_rho(self) -> float:  # NEW
+    def _compute_rho(self) -> float:
         """
-        Compute rho value for trust region update.
-        rho = actual improvement / predicted improvement.
+        Compute rho = actual_improvement / predicted_improvement
+        Robust: uses .value safely, uses defects as X[:,1:] - X_nl[:,1:],
+        protects against None and near-zero denominators.
         """
         # gamma_lambda non so cosa mettere come argomenti
         # running_cost Lamba potrebbe essere attuatori (U), arg_5 potrebbe essere vincoli non convessi [s(t,X,U,p)]^+
