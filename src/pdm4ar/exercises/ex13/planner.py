@@ -28,13 +28,13 @@ class SolverParameters:
     """
 
     # Cvxpy solver parameters
-    solver: str = "ECOS"  # specify solver to use
+    solver: str = "CLARABEL"  # specify solver to use
     verbose_solver: bool = False  # if True, the optimization steps are shown
     max_iterations: int = 30  # max algorithm iterations
 
     # SCVX parameters (Add paper reference)
     lambda_nu: float = 1e5  # slack variable weight
-    weight_p: NDArray = field(default_factory=lambda: 10 * np.array([[1.0]]).reshape((1, -1)))  # weight for final time
+    weight_p: NDArray = field(default_factory=lambda: 100 * np.array([[1.0]]).reshape((1, -1)))  # weight for final time
 
     tr_radius: float = 5  # initial trust region radius
     min_tr_radius: float = 1e-4  # min trust region radius      #IN THE PAPER IT IS 1E-3
@@ -82,6 +82,8 @@ class SatellitePlanner:
         asteroids: dict[PlayerName, AsteroidParams],
         sg: SatelliteGeometry,
         sp: SatelliteParameters,
+        docking=None,
+        box=None,
     ):
         """
         Pass environment information to the planner.
@@ -90,6 +92,21 @@ class SatellitePlanner:
         self.asteroids = asteroids
         self.sg = sg
         self.sp = sp
+        self.docking = docking
+        self.box = box
+
+        if docking is not None:
+            A1 = np.array(docking["A1"])
+            A2 = np.array(docking["A2"])
+            self.dockingA = np.array(docking["A"])
+            docklen = np.linalg.norm(A2 - A1)
+            base = (A2 - A1) / docklen
+            normale = np.array([-base[1], base[0]])
+
+            self.dockingA1 = A1
+            self.dockingA2 = A2
+            self.docking_normale = normale
+            self.docking_base = base
 
         self.error: float = 0.0
 
@@ -291,6 +308,27 @@ class SatellitePlanner:
             )
         ]
 
+        # BOX CONSTRAINTS
+        if self.box is not None:
+            min_x, min_y, max_x, max_y = self.box.shape.bounds
+            # print(min_x, min_y, max_x, max_y)
+            constraints.append(
+                self.variables["X"][0, 1:-1]
+                >= min_x + np.sqrt((self.sg.w_panel + self.sg.w_half) ** 2 + self.sg.l_r**2)
+            )
+            constraints.append(
+                self.variables["X"][0, 1:-1]
+                <= max_x - np.sqrt((self.sg.w_panel + self.sg.w_half) ** 2 + self.sg.l_r**2)
+            )
+            constraints.append(
+                self.variables["X"][1, 1:-1]
+                >= min_y + np.sqrt((self.sg.w_panel + self.sg.w_half) ** 2 + self.sg.l_r**2)
+            )
+            constraints.append(
+                self.variables["X"][1, 1:-1]
+                <= max_y - np.sqrt((self.sg.w_panel + self.sg.w_half) ** 2 + self.sg.l_r**2)
+            )
+
         # TIME COSTRAINTS
         constraints.append(self.variables["p"] <= 80.0)
         constraints.append(self.variables["p"] >= 0.0)
@@ -354,6 +392,55 @@ class SatellitePlanner:
                 + self.variables["nu"][:, k]
             )
 
+        if self.docking is not None:
+
+            initial_k_docking = self.params.K - 3
+            A1_x = self.dockingA1[0]
+            A1_y = self.dockingA1[1]
+            A = self.dockingA
+
+            n1 = np.array([-self.docking_base[1], self.docking_base[0]])
+            n2 = np.array([self.docking_base[1], -self.docking_base[0]])
+
+            if np.dot(self.dockingA - self.dockingA1, n1) > 0:
+                normale = n1
+            else:
+                normale = n2
+
+            self.docking_normale = normale
+
+            normale_x = self.docking_normale[0]
+            normale_y = self.docking_normale[1]
+
+            base_x = self.docking_base[0]
+            base_y = self.docking_base[1]
+
+            for k in range(initial_k_docking - 6, self.params.K):
+                xk = self.variables["X"][0, k]
+                yk = self.variables["X"][1, k]
+
+                constraints.append((xk - A1_x) * normale_x + (yk - A1_y) * normale_y >= 0)  # above normal line
+                # BEYOND A1
+                # constraints.append(
+                #   (xk - A1_x) * base_x + (yk - A1_y) * base_y <= np.linalg.norm(self.dockingA2 - self.dockingA1) - 0.9
+                # )  # BEFORE A2
+
+            for k in range(initial_k_docking, self.params.K):
+
+                xk = self.variables["X"][0, k]
+                yk = self.variables["X"][1, k]
+
+                constraints.append(
+                    (xk - A1_x) * base_x + (yk - A1_y) * base_y
+                    >= 0.05 * np.linalg.norm(self.dockingA2 - self.dockingA1)
+                )
+                constraints.append(
+                    (xk - A1_x) * base_x + (yk - A1_y) * base_y
+                    <= 0.95 * np.linalg.norm(self.dockingA2 - self.dockingA1)
+                )  # BEYOND A1
+                # constraints.append(
+                #   (xk - A1_x) * base_x + (yk - A1_y) * base_y <= np.linalg.norm(self.dockingA2 - self.dockingA1) - 0.9
+                # )  # BEFORE A2
         return constraints
 
     def _get_objective(self) -> Union[cvx.Minimize, cvx.Maximize]:
