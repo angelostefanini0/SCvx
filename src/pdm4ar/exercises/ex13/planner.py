@@ -174,7 +174,7 @@ class SatellitePlanner:
 
             if self._check_convergence():
                 break
-            print(self.variables["nu_ic"].value)
+            # print(self.variables["nu_ic"].value)
 
             self._update_trust_region()  # copiando X star in self.X_bar(aggiornaimo X, U, p in self.X_bar ecc, eta)
 
@@ -283,12 +283,12 @@ class SatellitePlanner:
         constraints = [
             # self.variables["X"][:, 0] == self.problem_parameters["init_state"],  # HARD CONSTRAINT
             # ...
-            (  # TRUST REGION CONSTRAINT
-                cvx.sum_squares(self.variables["X"] - self.problem_parameters["X_bar"])
-                + cvx.sum_squares(self.variables["U"] - self.problem_parameters["U_bar"])
-                + cvx.sum_squares(self.variables["p"] - self.problem_parameters["p_bar"])
-                <= (self.problem_parameters["eta"]) ** 2  # ETA WITH OR WITHOUT .VALUE?
-            ),
+            (
+                cvx.norm(self.variables["X"] - self.problem_parameters["X_bar"], 1)
+                + cvx.norm(self.variables["U"] - self.problem_parameters["U_bar"], 1)
+                + cvx.norm(self.variables["p"] - self.problem_parameters["p_bar"], 1)
+                <= self.problem_parameters["eta"]
+            )
         ]
 
         # TIME COSTRAINTS
@@ -459,7 +459,7 @@ class SatellitePlanner:
             self.p_bar = self.variables["p"].value
         pass
 
-        print(self.problem_parameters["eta"].value)
+        # print(self.problem_parameters["eta"].value)
 
         # phi should return a scalar
 
@@ -472,7 +472,7 @@ class SatellitePlanner:
         # p = self.params.weight_p @ p
         # ic = self.params.lambda_nu * np.linalg.norm(X[:, 0] - self.problem_parameters["init_state"].value, ord=1)
         tc = self.params.lambda_nu * np.linalg.norm(X[:, -1] - self.problem_parameters["goal_state"].value, ord=1)
-        print(tc)
+        # print(tc)
         return float(
             self.params.weight_p @ p
             + self.params.lambda_nu * np.linalg.norm(X[:, 0] - self.problem_parameters["init_state"].value, ord=1)
@@ -516,7 +516,7 @@ class SatellitePlanner:
         # defect matrix for transitions k=0..K-2 -> columns correspond to k -> k+1
         defects_mat = X[:, 1:] - X_nl[:, 1:]  # shape (n_x, K-1)
         defects_list = [defects_mat[:, k] for k in range(self.params.K - 1)]
-        print("Defects norm: ", defects_list[0:5])
+        # print("Defects norm: ", defects_list[0:5])
         return defects_list
 
     def _compute_rho(self) -> float:
