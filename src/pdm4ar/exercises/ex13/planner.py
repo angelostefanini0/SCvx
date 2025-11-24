@@ -30,7 +30,7 @@ class SolverParameters:
     # Cvxpy solver parameters
     solver: str = "CLARABEL"  # specify solver to use
     verbose_solver: bool = False  # if True, the optimization steps are shown
-    max_iterations: int = 30  # max algorithm iterations
+    max_iterations: int = 50  # max algorithm iterations
 
     # SCVX parameters (Add paper reference)
     lambda_nu: float = 1e5  # slack variable weight
@@ -522,6 +522,7 @@ class SatellitePlanner:
                 + cvx.norm1(self.variables["nu_s"][k])
                 + cvx.norm1(self.variables["nu_ast"][k])
             )
+            running_cost = cvx.norm1(self.variables["U"][:, k])
             Gamma.append(
                 running_cost + self.params.lambda_nu * P
             )  # CAPIAMO COME TRATTARLO NU_S SE ZERO, NONE O TOGLIERLO DEL TUTTO
@@ -637,7 +638,7 @@ class SatellitePlanner:
 
         for k in range(self.params.K - 1):
             defect_penalty = np.linalg.norm(defect[k], ord=1)
-
+            running_cost = np.linalg.norm(U[:, k], ord=1)
             obstacle_violation_sum = 0.0
 
             for i in self.planets:
