@@ -106,7 +106,7 @@ class SatelliteAgent(Agent):
         #
         self.box = None
         for obstacle in self.obstacles:
-            print("dentro")
+            # print("dentro")
             if isinstance(obstacle.shape, LineString):
                 self.box = obstacle
                 break
