@@ -265,6 +265,7 @@ class SatellitePlanner:
             "nu_s": cvx.Variable((self.params.K)),  # NOT SO SURE, IT'S FOR CONTRAINTS
             "nu_ic": cvx.Variable(self.satellite.n_x),
             # "nu_tc": cvx.Variable(self.satellite.n_x - 1),  # JUST POSITION, NOT VELOCITY
+            "nu_ast": cvx.Variable((self.params.K)),
         }
 
         return variables
@@ -366,6 +367,46 @@ class SatellitePlanner:
                 rprime = -((xbar - xp) ** 2) - (ybar - yp) ** 2 + R**2 + 2 * (xbar - xp) * xbar + 2 * (ybar - yp) * ybar
 
                 constraints.append(Cx * xk + Cy * yk + rprime <= self.variables["nu_s"][k])
+
+        # ASTEROID AVOIDANCE CONSTRAINTS
+        if len(self.asteroids) > 0:
+            for i in self.asteroids:
+                asteroids = self.asteroids[i]
+                x_zero, y_zero = asteroids.start  # posizione frame I
+                vx, vy = asteroids.velocity  # velocity nel frame A
+                orientation = asteroids.orientation  # IA
+
+                c = np.cos(orientation)
+                s = np.sin(orientation)
+
+                R = asteroids.radius + np.sqrt((self.sg.w_panel + self.sg.w_half) ** 2 + self.sg.l_r**2)
+                Vx = vx * c - vy * s  # velocity frame I
+                Vy = vx * s + vy * c  # velocity frame I
+
+                for k in range(self.params.K - 1):
+                    xk = self.variables["X"][0, k]
+                    yk = self.variables["X"][1, k]
+
+                    xbar = self.problem_parameters["X_bar"][0, k]
+                    ybar = self.problem_parameters["X_bar"][1, k]
+
+                    tbar = k / (self.params.K - 1)  # step di discretizzazione da 0 a 1
+
+                    xp = x_zero + Vx * tbar
+                    yp = y_zero + Vy * tbar
+                    # print(xp, yp, self.asteroids[i])
+
+                    Gt = 2 * (xbar - xp) * Vx + 2 * (ybar - yp) * Vy
+
+                    Cx = -2 * (xbar - xp)
+                    Cy = -2 * (ybar - yp)
+
+                    rprime = -((xbar - xp) ** 2) - ((ybar - yp) ** 2) + R**2 - Gt * tbar - Cy * ybar - Cx * xbar
+
+                    constraints.append(
+                        Cx * xk + Cy * yk + Gt * (self.variables["p"] * k / (self.params.K - 1)) + rprime
+                        <= self.variables["nu_ast"][k]
+                    )
 
         # DYNAMICS CONSTRAINTS
 
@@ -598,7 +639,6 @@ class SatellitePlanner:
             for i in self.planets:
                 planet = self.planets[i]
                 xp, yp = planet.center
-
                 # Calcolo Raggio aumentato
                 R = planet.radius + np.sqrt((self.sg.w_panel + self.sg.w_half) ** 2 + self.sg.l_r**2)
 
@@ -608,6 +648,24 @@ class SatellitePlanner:
 
                 if val >= 0:
                     obstacle_violation_sum += val
+
+            if len(self.asteroids) > 0:
+                tbar = k / (self.params.K - 1)
+                for j in self.asteroids:
+                    asteroid = self.asteroids[j]
+                    x_zero, y_zero = asteroid.start
+                    vx, vy = asteroid.velocity
+                    Vx = vx * np.cos(asteroid.orientation) - vy * np.sin(asteroid.orientation)  # velocity frame I
+                    Vy = vx * np.sin(asteroid.orientation) + vy * np.cos(asteroid.orientation)  # velocity frame I
+                    x_ast = x_zero + Vx * tbar
+                    y_ast = y_zero + Vy * tbar
+                    # Calcolo Raggio aumentato
+                    R2 = asteroid.radius + np.sqrt((self.sg.w_panel + self.sg.w_half) ** 2 + self.sg.l_r**2)
+
+                    val2 = -((X[0, k] - x_ast) ** 2) - (X[1, k] - y_ast) ** 2 + R2**2
+
+                    if val >= 0:
+                        obstacle_violation_sum += val2
 
             # La penalità totale è lambda * (errore dinamica + errore ostacoli)
             total_penalty = self.params.lambda_nu * (defect_penalty + obstacle_violation_sum)
