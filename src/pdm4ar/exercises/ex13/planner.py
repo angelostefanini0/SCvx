@@ -192,7 +192,7 @@ class SatellitePlanner:
             if self._check_convergence():
                 break
             # print(self.variables["nu_ic"].value)
-
+            # print("nu_ast", self.variables["nu_ast"].value)
             self._update_trust_region()  # copiando X star in self.X_bar(aggiornaimo X, U, p in self.X_bar ecc, eta)
 
         # costruisci sequenze di comandi e stati dalla soluzione finale
@@ -390,7 +390,9 @@ class SatellitePlanner:
                     xbar = self.problem_parameters["X_bar"][0, k]
                     ybar = self.problem_parameters["X_bar"][1, k]
 
-                    tbar = k / (self.params.K - 1)  # step di discretizzazione da 0 a 1
+                    tbar = (
+                        self.problem_parameters["p_bar"] * k / (self.params.K - 1)
+                    )  # step di discretizzazione da 0 a 1
 
                     xp = x_zero + Vx * tbar
                     yp = y_zero + Vy * tbar
@@ -515,9 +517,11 @@ class SatellitePlanner:
         running_cost = 0.0  # WE COULD ADD ACTUATION FORCES
         Gamma = []  # TO WRITE
         for k in range(self.params.K):
-            P = cvx.norm1(self.variables["nu"][:, k]) + cvx.norm1(
-                self.variables["nu_s"][k]
-            )  # SE RIUSCIAMO AD AVERE TUTIT VINCOLI CONVESSI NU_S INUTILE
+            P = (
+                cvx.norm1(self.variables["nu"][:, k])
+                + cvx.norm1(self.variables["nu_s"][k])
+                + cvx.norm1(self.variables["nu_ast"][k])
+            )
             Gamma.append(
                 running_cost + self.params.lambda_nu * P
             )  # CAPIAMO COME TRATTARLO NU_S SE ZERO, NONE O TOGLIERLO DEL TUTTO
@@ -620,7 +624,7 @@ class SatellitePlanner:
         """
         # p = self.params.weight_p @ p
         # ic = self.params.lambda_nu * np.linalg.norm(X[:, 0] - self.problem_parameters["init_state"].value, ord=1)
-        tc = self.params.lambda_nu * np.linalg.norm(X[:, -1] - self.problem_parameters["goal_state"].value, ord=1)
+        # tc = self.params.lambda_nu * np.linalg.norm(X[:, -1] - self.problem_parameters["goal_state"].value, ord=1)
         # print(tc)
         return float(
             self.params.weight_p @ p
@@ -650,7 +654,7 @@ class SatellitePlanner:
                     obstacle_violation_sum += val
 
             if len(self.asteroids) > 0:
-                tbar = k / (self.params.K - 1)
+                tbar = self.problem_parameters["p_bar"].value * k / (self.params.K - 1)
                 for j in self.asteroids:
                     asteroid = self.asteroids[j]
                     x_zero, y_zero = asteroid.start
