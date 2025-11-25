@@ -381,7 +381,7 @@ class SatellitePlanner:
 
                 R = asteroids.radius + np.sqrt((self.sg.w_panel + self.sg.w_half) ** 2 + self.sg.l_r**2)
                 Vx = vx * c - vy * s  # velocity frame I
-                Vy = vx * s + vy * c  # velocity frame I
+                Vy = vx * s + vy * c
 
                 for k in range(self.params.K - 1):
                     xk = self.variables["X"][0, k]
