@@ -522,7 +522,7 @@ class SatellitePlanner:
                 + cvx.norm1(self.variables["nu_s"][k])
                 + cvx.norm1(self.variables["nu_ast"][k])
             )
-            running_cost = cvx.norm1(self.variables["U"][:, k])
+            running_cost = cvx.norm1(self.variables["U"][:, k]) * 30.0
             Gamma.append(
                 running_cost + self.params.lambda_nu * P
             )  # CAPIAMO COME TRATTARLO NU_S SE ZERO, NONE O TOGLIERLO DEL TUTTO
@@ -585,7 +585,7 @@ class SatellitePlanner:
         """
         rho = self._compute_rho()  # WE MUST PAY ATTENTION TO SELF.ETA IF NEEDS TO BE RESTART FROM INIT VALUE
         # Update trust region considering the computed rho
-        print(f"Rho: {rho}")
+        # print(f"Rho: {rho}")
 
         # print(rho <= self.params.rho_0)
         if rho <= self.params.rho_0:
@@ -638,7 +638,7 @@ class SatellitePlanner:
 
         for k in range(self.params.K - 1):
             defect_penalty = np.linalg.norm(defect[k], ord=1)
-            running_cost = np.linalg.norm(U[:, k], ord=1)
+            running_cost = np.linalg.norm(U[:, k], ord=1) * 30.0
             obstacle_violation_sum = 0.0
 
             for i in self.planets:
