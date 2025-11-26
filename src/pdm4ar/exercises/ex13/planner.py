@@ -486,7 +486,7 @@ class SatellitePlanner:
             base_y = float(base[1])
             base_len = float(np.linalg.norm(self.dockingA2 - self.dockingA1))
 
-            for k in range(initial_k_docking - 6, self.params.K):
+            for k in range(initial_k_docking, self.params.K):
                 xk = self.variables["X"][0, k]
                 yk = self.variables["X"][1, k]
 
@@ -669,7 +669,7 @@ class SatellitePlanner:
 
                     val2 = -((X[0, k] - x_ast) ** 2) - (X[1, k] - y_ast) ** 2 + R2**2
 
-                    if val >= 0:
+                    if val2 >= 0:
                         obstacle_violation_sum += val2
 
             # La penalità totale è lambda * (errore dinamica + errore ostacoli)
