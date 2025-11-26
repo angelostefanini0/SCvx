@@ -13,6 +13,7 @@ from dg_commons.sim.models.satellite_structures import (
     SatelliteGeometry,
     SatelliteParameters,
 )
+from matplotlib.pylab import f
 
 # from pdm4ar.exercises.ex13.agent import SatelliteAgent
 from pdm4ar.exercises.ex13.discretization import *
@@ -27,9 +28,9 @@ class SolverParameters:
     """
 
     # Cvxpy solver parameters
-    solver: str = "ECOS"  # specify solver to use
+    solver: str = "CLARABEL"  # specify solver to use
     verbose_solver: bool = False  # if True, the optimization steps are shown
-    max_iterations: int = 30  # max algorithm iterations
+    max_iterations: int = 50  # max algorithm iterations
 
     # SCVX parameters (Add paper reference)
     lambda_nu: float = 1e5  # slack variable weight
@@ -81,6 +82,8 @@ class SatellitePlanner:
         asteroids: dict[PlayerName, AsteroidParams],
         sg: SatelliteGeometry,
         sp: SatelliteParameters,
+        docking=None,
+        box=None,
     ):
         """
         Pass environment information to the planner.
@@ -89,6 +92,21 @@ class SatellitePlanner:
         self.asteroids = asteroids
         self.sg = sg
         self.sp = sp
+        self.docking = docking
+        self.box = box
+
+        if docking is not None:
+            A1 = np.array(docking["A1"])
+            A2 = np.array(docking["A2"])
+            self.dockingA = np.array(docking["A"])
+            docklen = np.linalg.norm(A2 - A1)
+            base = (A2 - A1) / docklen
+            normale = np.array([-base[1], base[0]])
+
+            self.dockingA1 = A1
+            self.dockingA2 = A2
+            self.docking_normale = normale
+            self.docking_base = base
 
         self.error: float = 0.0
 
@@ -173,8 +191,8 @@ class SatellitePlanner:
 
             if self._check_convergence():
                 break
-            print(self.variables["nu_ic"].value)
-
+            # print(self.variables["nu_ic"].value)
+            # print("nu_ast", self.variables["nu_ast"].value)
             self._update_trust_region()  # copiando X star in self.X_bar(aggiornaimo X, U, p in self.X_bar ecc, eta)
 
         # costruisci sequenze di comandi e stati dalla soluzione finale
@@ -247,6 +265,7 @@ class SatellitePlanner:
             "nu_s": cvx.Variable((self.params.K)),  # NOT SO SURE, IT'S FOR CONTRAINTS
             "nu_ic": cvx.Variable(self.satellite.n_x),
             # "nu_tc": cvx.Variable(self.satellite.n_x - 1),  # JUST POSITION, NOT VELOCITY
+            "nu_ast": cvx.Variable((self.params.K)),
         }
 
         return variables
@@ -280,15 +299,36 @@ class SatellitePlanner:
         """
 
         constraints = [
-            # self.variables["X"][:, 0] == self.problem_parameters["init_state"],
+            # self.variables["X"][:, 0] == self.problem_parameters["init_state"],  # HARD CONSTRAINT
             # ...
-            (  # TRUST REGION CONSTRAINT
-                cvx.sum_squares(self.variables["X"] - self.problem_parameters["X_bar"])
-                + cvx.sum_squares(self.variables["U"] - self.problem_parameters["U_bar"])
-                + cvx.sum_squares(self.variables["p"] - self.problem_parameters["p_bar"])
-                <= (self.problem_parameters["eta"]) ** 2  # ETA WITH OR WITHOUT .VALUE?
-            ),
+            (
+                cvx.norm(self.variables["X"] - self.problem_parameters["X_bar"], 2)
+                + cvx.norm(self.variables["U"] - self.problem_parameters["U_bar"], 2)
+                + cvx.norm(self.variables["p"] - self.problem_parameters["p_bar"], 2)
+                <= self.problem_parameters["eta"]
+            )
         ]
+
+        # BOX CONSTRAINTS
+        if self.box is not None:
+            min_x, min_y, max_x, max_y = self.box.shape.bounds
+            # print(min_x, min_y, max_x, max_y)
+            constraints.append(
+                self.variables["X"][0, 1:-1]
+                >= min_x + np.sqrt((self.sg.w_panel + self.sg.w_half) ** 2 + self.sg.l_r**2)
+            )
+            constraints.append(
+                self.variables["X"][0, 1:-1]
+                <= max_x - np.sqrt((self.sg.w_panel + self.sg.w_half) ** 2 + self.sg.l_r**2)
+            )
+            constraints.append(
+                self.variables["X"][1, 1:-1]
+                >= min_y + np.sqrt((self.sg.w_panel + self.sg.w_half) ** 2 + self.sg.l_r**2)
+            )
+            constraints.append(
+                self.variables["X"][1, 1:-1]
+                <= max_y - np.sqrt((self.sg.w_panel + self.sg.w_half) ** 2 + self.sg.l_r**2)
+            )
 
         # TIME COSTRAINTS
         constraints.append(self.variables["p"] <= 80.0)
@@ -305,7 +345,7 @@ class SatellitePlanner:
             self.variables["U"][0, :] <= self.satellite.sp.F_limits[1],
         ]
         constraints.append(
-            self.variables["X"][:, 0] - self.problem_parameters["init_state"][:] == -self.variables["nu_ic"]
+            self.variables["X"][:, 0] + self.variables["nu_ic"] == self.problem_parameters["init_state"][:]
         )
 
         # PLANET AVOIDANCE CONSTRAINTS
@@ -327,6 +367,48 @@ class SatellitePlanner:
                 rprime = -((xbar - xp) ** 2) - (ybar - yp) ** 2 + R**2 + 2 * (xbar - xp) * xbar + 2 * (ybar - yp) * ybar
 
                 constraints.append(Cx * xk + Cy * yk + rprime <= self.variables["nu_s"][k])
+
+        # ASTEROID AVOIDANCE CONSTRAINTS
+        if len(self.asteroids) > 0:
+            for i in self.asteroids:
+                asteroids = self.asteroids[i]
+                x_zero, y_zero = asteroids.start  # posizione frame I
+                vx, vy = asteroids.velocity  # velocity nel frame A
+                orientation = asteroids.orientation  # IA
+
+                c = np.cos(orientation)
+                s = np.sin(orientation)
+
+                R = asteroids.radius + np.sqrt((self.sg.w_panel + self.sg.w_half) ** 2 + self.sg.l_r**2)
+                Vx = vx * c - vy * s  # velocity frame I
+                Vy = vx * s + vy * c
+
+                for k in range(self.params.K - 1):
+                    xk = self.variables["X"][0, k]
+                    yk = self.variables["X"][1, k]
+
+                    xbar = self.problem_parameters["X_bar"][0, k]
+                    ybar = self.problem_parameters["X_bar"][1, k]
+
+                    tbar = (
+                        self.problem_parameters["p_bar"] * k / (self.params.K - 1)
+                    )  # step di discretizzazione da 0 a 1
+
+                    xp = x_zero + Vx * tbar
+                    yp = y_zero + Vy * tbar
+                    # print(xp, yp, self.asteroids[i])
+
+                    Gt = 2 * (xbar - xp) * Vx + 2 * (ybar - yp) * Vy
+
+                    Cx = -2 * (xbar - xp)
+                    Cy = -2 * (ybar - yp)
+
+                    rprime = -((xbar - xp) ** 2) - ((ybar - yp) ** 2) + R**2 - Gt * tbar - Cy * ybar - Cx * xbar
+
+                    constraints.append(
+                        Cx * xk + Cy * yk + Gt * (self.variables["p"] * k / (self.params.K - 1)) + rprime
+                        <= self.variables["nu_ast"][k]
+                    )
 
         # DYNAMICS CONSTRAINTS
 
@@ -353,6 +435,73 @@ class SatellitePlanner:
                 + self.variables["nu"][:, k]
             )
 
+        if self.docking is not None:
+
+            A1 = self.dockingA1
+            A2 = self.dockingA2
+            A = self.dockingA
+            D = self
+
+            base = self.docking_base
+
+            center_seg = 0.5 * (A1 + A2)
+            cx, cy = float(center_seg[0]), float(center_seg[1])
+
+            R = np.linalg.norm(A1 - A2) / 2 + np.sqrt((self.sg.w_panel + self.sg.w_half) ** 2 + self.sg.l_r**2)
+
+            k_release = self.params.K - 5
+
+            for k in range(k_release):
+                xk = self.variables["X"][0, k]
+                yk = self.variables["X"][1, k]
+
+                xbar = self.problem_parameters["X_bar"][0, k]
+                ybar = self.problem_parameters["X_bar"][1, k]
+
+                Cx = -2 * (xbar - cx)
+                Cy = -2 * (ybar - cy)
+
+                rprime = -((xbar - cx) ** 2) - (ybar - cy) ** 2 + R**2 + 2 * (xbar - cx) * xbar + 2 * (ybar - cy) * ybar
+
+                constraints.append(Cx * xk + Cy * yk + rprime <= 0)
+
+            initial_k_docking = self.params.K - 6
+            A1_x = A1[0]
+            A1_y = A1[1]
+
+            n1 = np.array([-base[1], base[0]])
+            n2 = np.array([base[1], -base[0]])
+
+            if np.dot(A - A1, n1) > 0:
+                normale = n1
+            else:
+                normale = n2
+
+            self.docking_normale = normale
+
+            normale_x = float(self.docking_normale[0])
+            normale_y = float(self.docking_normale[1])
+
+            base_x = float(base[0])
+            base_y = float(base[1])
+            base_len = float(np.linalg.norm(self.dockingA2 - self.dockingA1))
+
+            for k in range(initial_k_docking - 6, self.params.K):
+                xk = self.variables["X"][0, k]
+                yk = self.variables["X"][1, k]
+
+                constraints.append((xk - A1_x) * normale_x + (yk - A1_y) * normale_y >= self.sg.l_r)
+
+                xk = self.variables["X"][0, k]
+                yk = self.variables["X"][1, k]
+
+            for k in range(initial_k_docking + 2, self.params.K):
+                xk = self.variables["X"][0, k]
+                yk = self.variables["X"][1, k]
+
+                proj = (xk - A1_x) * base_x + (yk - A1_y) * base_y
+                constraints.append(proj >= 0.05 * base_len)
+                constraints.append(proj <= 0.95 * base_len)
         return constraints
 
     def _get_objective(self) -> Union[cvx.Minimize, cvx.Maximize]:
@@ -365,12 +514,15 @@ class SatellitePlanner:
         obj_terminal_violations = self.params.lambda_nu * cvx.norm(self.variables["nu_ic"][:], p=1)
         phi = obj_time + obj_terminal_violations  # 50, terminal cost
 
-        running_cost = 0  # WE COULD ADD ACTUATION FORCES
+        running_cost = 0.0  # WE COULD ADD ACTUATION FORCES
         Gamma = []  # TO WRITE
-        for k in range(self.params.K - 1):
-            P = cvx.norm1(self.variables["nu"][:, k]) + cvx.norm1(
-                self.variables["nu_s"][k]
-            )  # SE RIUSCIAMO AD AVERE TUTIT VINCOLI CONVESSI NU_S INUTILE
+        for k in range(self.params.K):
+            P = (
+                cvx.norm1(self.variables["nu"][:, k])
+                + cvx.norm1(self.variables["nu_s"][k])
+                + cvx.norm1(self.variables["nu_ast"][k])
+            )
+            running_cost = cvx.norm1(self.variables["U"][:, k]) * 30.0
             Gamma.append(
                 running_cost + self.params.lambda_nu * P
             )  # CAPIAMO COME TRATTARLO NU_S SE ZERO, NONE O TOGLIERLO DEL TUTTO
@@ -381,7 +533,7 @@ class SatellitePlanner:
         """
         Compute trapezoidal integration of a list.
         """
-        delta_t = 1.0 / self.params.K
+        delta_t = 1.0 / (self.params.K - 1)  # self.p_bar[0] ? forse K ?
         integral = 0
         for i in range(len(values) - 1):  # in paper from 1 to K-1 but here from 0 to K-2
             integral += values[i] + values[i + 1]
@@ -419,6 +571,9 @@ class SatellitePlanner:
         """
         Check convergence of SCvx.
         """  # WE COULD INSTEAD CHECK J_lambda - L_lambda <= stop_crit
+        if self.variables["X"].value is None or self.X_bar is None:
+            print("Warning: One of the variables (X or X_bar) is None, skipping convergence check.")
+            return False
         delta_x = np.linalg.norm(self.variables["X"].value - self.X_bar, axis=0)
         delta_p = np.linalg.norm(self.variables["p"].value - self.p_bar)
 
@@ -430,7 +585,7 @@ class SatellitePlanner:
         """
         rho = self._compute_rho()  # WE MUST PAY ATTENTION TO SELF.ETA IF NEEDS TO BE RESTART FROM INIT VALUE
         # Update trust region considering the computed rho
-        print(f"Rho: {rho}")
+        # print(f"Rho: {rho}")
 
         # print(rho <= self.params.rho_0)
         if rho <= self.params.rho_0:
@@ -458,7 +613,7 @@ class SatellitePlanner:
             self.p_bar = self.variables["p"].value
         pass
 
-        print(self.problem_parameters["eta"].value)
+        # print(self.problem_parameters["eta"].value)
 
         # phi should return a scalar
 
@@ -470,8 +625,8 @@ class SatellitePlanner:
         """
         # p = self.params.weight_p @ p
         # ic = self.params.lambda_nu * np.linalg.norm(X[:, 0] - self.problem_parameters["init_state"].value, ord=1)
-        tc = self.params.lambda_nu * np.linalg.norm(X[:, -1] - self.problem_parameters["goal_state"].value, ord=1)
-        print(tc)
+        # tc = self.params.lambda_nu * np.linalg.norm(X[:, -1] - self.problem_parameters["goal_state"].value, ord=1)
+        # print(tc)
         return float(
             self.params.weight_p @ p
             + self.params.lambda_nu * np.linalg.norm(X[:, 0] - self.problem_parameters["init_state"].value, ord=1)
@@ -483,13 +638,12 @@ class SatellitePlanner:
 
         for k in range(self.params.K - 1):
             defect_penalty = np.linalg.norm(defect[k], ord=1)
-
+            running_cost = np.linalg.norm(U[:, k], ord=1) * 30.0
             obstacle_violation_sum = 0.0
 
             for i in self.planets:
                 planet = self.planets[i]
                 xp, yp = planet.center
-
                 # Calcolo Raggio aumentato
                 R = planet.radius + np.sqrt((self.sg.w_panel + self.sg.w_half) ** 2 + self.sg.l_r**2)
 
@@ -499,6 +653,24 @@ class SatellitePlanner:
 
                 if val >= 0:
                     obstacle_violation_sum += val
+
+            if len(self.asteroids) > 0:
+                tbar = self.problem_parameters["p_bar"].value * k / (self.params.K - 1)
+                for j in self.asteroids:
+                    asteroid = self.asteroids[j]
+                    x_zero, y_zero = asteroid.start
+                    vx, vy = asteroid.velocity
+                    Vx = vx * np.cos(asteroid.orientation) - vy * np.sin(asteroid.orientation)  # velocity frame I
+                    Vy = vx * np.sin(asteroid.orientation) + vy * np.cos(asteroid.orientation)  # velocity frame I
+                    x_ast = x_zero + Vx * tbar
+                    y_ast = y_zero + Vy * tbar
+                    # Calcolo Raggio aumentato
+                    R2 = asteroid.radius + np.sqrt((self.sg.w_panel + self.sg.w_half) ** 2 + self.sg.l_r**2)
+
+                    val2 = -((X[0, k] - x_ast) ** 2) - (X[1, k] - y_ast) ** 2 + R2**2
+
+                    if val >= 0:
+                        obstacle_violation_sum += val2
 
             # La penalità totale è lambda * (errore dinamica + errore ostacoli)
             total_penalty = self.params.lambda_nu * (defect_penalty + obstacle_violation_sum)
@@ -511,28 +683,18 @@ class SatellitePlanner:
         """
         Compute the discretization defect numerically (NOT as CVX expressions).
         """
-        defects = []
-        X_ln = self.integrator.integrate_nonlinear_piecewise(X, U, p)
-        for k in range(self.params.K - 1):
+        X_nl = self.integrator.integrate_nonlinear_piecewise(X, U, p)  # shape (n_x, K)
+        # defect matrix for transitions k=0..K-2 -> columns correspond to k -> k+1
+        defects_mat = X[:, 1:] - X_nl[:, 1:]  # shape (n_x, K-1)
+        defects_list = [defects_mat[:, k] for k in range(self.params.K - 1)]
+        # print("Defects norm: ", defects_list[0:5])
+        return defects_list
 
-            A = self.problem_parameters["A_bar"][:, k].value.reshape(self.satellite.n_x, self.satellite.n_x, order="F")
-            Bp = self.problem_parameters["B_plus_bar"][:, k].value.reshape(
-                self.satellite.n_x, self.satellite.n_u, order="F"
-            )
-            Bm = self.problem_parameters["B_minus_bar"][:, k].value.reshape(
-                self.satellite.n_x, self.satellite.n_u, order="F"
-            )
-            F = self.problem_parameters["F_bar"][:, k].value.reshape(self.satellite.n_x, self.satellite.n_p, order="F")
-            r = self.problem_parameters["r_bar"][:, k].value
-
-            defects.append(-X_ln[:, k + 1] + (A @ X[:, k] + Bp @ U[:, k + 1] + Bm @ U[:, k] + F @ p + r))
-
-        return defects
-
-    def _compute_rho(self) -> float:  # NEW
+    def _compute_rho(self) -> float:
         """
-        Compute rho value for trust region update.
-        rho = actual improvement / predicted improvement.
+        Compute rho = actual_improvement / predicted_improvement
+        Robust: uses .value safely, uses defects as X[:,1:] - X_nl[:,1:],
+        protects against None and near-zero denominators.
         """
         # gamma_lambda non so cosa mettere come argomenti
         # running_cost Lamba potrebbe essere attuatori (U), arg_5 potrebbe essere vincoli non convessi [s(t,X,U,p)]^+

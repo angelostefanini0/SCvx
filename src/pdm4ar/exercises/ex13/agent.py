@@ -9,7 +9,7 @@ from dg_commons.sim.models.obstacles import StaticObstacle
 from dg_commons.sim.models.obstacles_dyn import DynObstacleState
 from dg_commons.sim.models.satellite import SatelliteCommands, SatelliteState
 from dg_commons.sim.models.satellite_structures import SatelliteGeometry, SatelliteParameters
-
+from shapely.geometry import LineString
 from pdm4ar.exercises.ex13.planner import SatellitePlanner
 from pdm4ar.exercises_def.ex13.goal import SpaceshipTarget, DockingTarget
 from pdm4ar.exercises_def.ex13.utils_params import PlanetParams, AsteroidParams
@@ -83,6 +83,8 @@ class SatelliteAgent(Agent):
         self.myname = init_sim_obs.my_name
         self.sg = init_sim_obs.model_geometry
         self.sp = init_sim_obs.model_params
+        self.obstacles = init_sim_obs.dg_scenario.static_obstacles
+
         self.planner = SatellitePlanner(planets=self.planets, asteroids=self.asteroids, sg=self.sg, sp=self.sp)
         assert isinstance(init_sim_obs.goal, SpaceshipTarget | DockingTarget)
         # make sure you consider both types of goals accordingly
@@ -90,14 +92,28 @@ class SatelliteAgent(Agent):
         # to take into account the docking structure)
         self.goal_state = init_sim_obs.goal.target
 
+        docking = None
+
         # Plot docking station (this is optional, for better visualization)
         if Config.PLOT and isinstance(init_sim_obs.goal, DockingTarget):
             A, B, C, A1, A2, half_p_angle = init_sim_obs.goal.get_landing_constraint_points()
             init_sim_obs.goal.plot_landing_points(A, B, C, A1, A2)
 
+            docking = {"A": A, "B": B, "C": C, "A1": A1, "A2": A2, "half_p_angle": half_p_angle}
+
         #
         # TODO: Implement Compute Initial Trajectory
         #
+        self.box = None
+        for obstacle in self.obstacles:
+            # print("dentro")
+            if isinstance(obstacle.shape, LineString):
+                self.box = obstacle
+                break
+
+        self.planner = SatellitePlanner(
+            planets=self.planets, asteroids=self.asteroids, sp=self.sp, sg=self.sg, docking=docking, box=self.box
+        )
 
         self.cmds_plan, self.state_traj = self.planner.compute_trajectory(self.init_state, self.goal_state)
 
@@ -119,13 +135,12 @@ class SatelliteAgent(Agent):
         self.actual_trajectory.append(current_state)
         expected_state = self.state_traj.at_interp(sim_obs.time)
 
-        # plotting the trajectory every 2.5 sec (this is optional, for better visualization)
-        if Config.PLOT and int(10 * sim_obs.time) % 25 == 0:
-            plot_traj(self.state_traj, self.actual_trajectory)
+        """if current_state.x - expected_state.x > 1.0 or current_state.y - expected_state.y:
+            self.cmds_plan, self.state_traj = self.planner.compute_trajectory(expected_state, self.goal_state)"""
 
-        #
-        # TODO: Implement scheme to replan
-        #
+        # plotting the trajectory every 2.5 sec (this is optional, for better visualization)
+        if Config.PLOT and int(10 * sim_obs.time) % 10 == 0:
+            plot_traj(self.state_traj, self.actual_trajectory)
 
         # ZeroOrderHold
         # cmds = self.cmds_plan.at_or_previous(sim_obs.time)
