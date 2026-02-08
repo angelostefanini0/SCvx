@@ -53,4 +53,4 @@ The evaluation framework automatically calls the planner through the provided in
 4.  **Execution:** The simulator executes the trajectory and checks feasibility.
 5.  **Diagnostics:** Execution time and solver diagnostics are logged during runtime.
 
-<video src="C:\Users\angel\Downloads\Evaluation-Final25-config-3-public-EpisodeVisualisation-figure1-Animation.mp4" width="100%" controls autoplay loop muted></video>
+<video src="docs/Recording 2026-02-08 204903.mp4" width="100%" controls></video>
