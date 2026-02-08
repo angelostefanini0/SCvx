@@ -52,6 +52,6 @@ The evaluation framework automatically calls the planner through the provided in
 3.  **Output:** The planner returns a command sequence and state trajectory.
 4.  **Execution:** The simulator executes the trajectory and checks feasibility.
 5.  **Diagnostics:** Execution time and solver diagnostics are logged during runtime.
-<video src="https://github.com/angelostefanini0/Multi-Agent-Multi-Goal-Pickup-and-Delivery/raw/main/docs/Recording%202026-02-08%20204903.mp4" width="100%" controls autoplay loop muted>
-  Il tuo browser non supporta il tag video.
+<video src="https://github.com/angelostefanini0/Multi-Agent-Multi-Goal-Pickup-and-Delivery/raw/main/docs/Recording.mp4" width="100%" controls autoplay loop muted>
+ 
 </video>
