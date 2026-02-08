@@ -52,6 +52,6 @@ The evaluation framework automatically calls the planner through the provided in
 3.  **Output:** The planner returns a command sequence and state trajectory.
 4.  **Execution:** The simulator executes the trajectory and checks feasibility.
 5.  **Diagnostics:** Execution time and solver diagnostics are logged during runtime.
-[![Demo](docs/thumbnail.png)](
-https://github.com/angelostefanini0/SCvx/docs/Recording.mp4
-)
+🎥 **Demo video**
+
+[Video](docs/Recording.mp4)
