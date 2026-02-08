@@ -53,5 +53,5 @@ The evaluation framework automatically calls the planner through the provided in
 4.  **Execution:** The simulator executes the trajectory and checks feasibility.
 5.  **Diagnostics:** Execution time and solver diagnostics are logged during runtime.
 [![Demo](docs/thumbnail.png)](
-https://github.com/angelostefanini0/Multi-Agent-Multi-Goal-Pickup-and-Delivery/raw/main/docs/Recording.mp4
+https://github.com/angelostefanini0/SCvx/docs/Recording.mp4
 )
